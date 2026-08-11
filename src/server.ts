@@ -42,6 +42,7 @@ import {
     renderUI,
     handleConfigGet,
     handleConfigPut,
+    publicWorkflowOptions,
     handleUsageSummary,
     handleUsageTrends,
     handleUsageModels,
@@ -356,6 +357,7 @@ async function handle(
             opts.proxyMode = fresh.proxyMode;
             opts.proxySource = fresh.proxySource;
             opts.proxyFallback = fresh.proxyFallback;
+            opts.workflow = fresh.workflow;
             resetProxyCache();
             for (const k of Object.keys(opts.routes)) delete opts.routes[k];
             Object.assign(opts.routes, loadRoutes());
@@ -1562,6 +1564,7 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
 }
 
 function sendStats(opts: ProxyOptions, res: http.ServerResponse): void {
+    const workflowOptions = opts.workflow ?? DEFAULT_WORKFLOW_OPTIONS;
     const sessions = listSessions().map((s) => ({
         id: s.id,
         protocol: s.meta.protocol,
@@ -1579,16 +1582,38 @@ function sendStats(opts: ProxyOptions, res: http.ServerResponse): void {
             enabled: opts.workflow?.enabled ?? DEFAULT_WORKFLOW_OPTIONS.enabled,
             projectId: s.workflow.projectId,
             currentPhase: s.workflow.activePhaseId,
+            currentTask: s.workflow.activeTaskId,
             phaseCount: Object.keys(s.workflow.phases).length,
+            taskCount: Object.keys(s.workflow.tasks).length,
             contextTargetRatio: opts.workflow?.targetContextRatio ?? DEFAULT_WORKFLOW_OPTIONS.targetContextRatio,
             metrics: s.workflow.metrics,
             archiveRecords: Object.keys(s.workflow.rawArchive).length,
             archiveTokens: Object.values(s.workflow.rawArchive).reduce((total, record) => total + record.tokenCount, 0),
+            scheduler: s.workflow.cacheTelemetry.lastDecision ?? null,
+            cache: {
+                sampleCount: s.workflow.cacheTelemetry.sampleCount,
+                cacheHitRatio: s.workflow.cacheTelemetry.recentUsage.at(-1)?.cacheHitRatio ?? null,
+                contextGrowthRate: s.workflow.cacheTelemetry.contextGrowthRate,
+            },
+            repository: {
+                root: s.workflow.repoBridge.repoRoot,
+                remote: s.workflow.repoBridge.remoteIdentity,
+                head: s.workflow.repoBridge.head,
+                dirty: s.workflow.repoBridge.dirty,
+                staleFiles: Object.values(s.workflow.repoBridge.files).filter((file) => file.stale).length,
+                unresolvedGuards: s.workflow.repoBridge.violations.filter((violation) => !violation.resolvedAt).length,
+                lastError: s.workflow.repoBridge.lastError,
+            },
+            historian: {
+                pendingTasks: s.workflow.historian.pendingTaskIds.length,
+                lastModel: s.workflow.historian.lastModel,
+                lastError: s.workflow.historian.lastError,
+            },
         },
         lastSeen: new Date(s.lastSeen).toISOString(),
     }));
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ sessions }, null, 2));
+    res.end(JSON.stringify({ workflow: publicWorkflowOptions(workflowOptions), sessions }, null, 2));
 }
 
 function headerValue(req: http.IncomingMessage, name: string): string | undefined {

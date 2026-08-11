@@ -8,6 +8,7 @@ export {
     handleConfigPut,
     readProviders,
     readUpstreamSettings,
+    publicWorkflowOptions,
 } from "./api.js";
 
 export {
