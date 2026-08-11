@@ -3,18 +3,20 @@ import assert from "node:assert/strict";
 import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
-import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
-import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
+import { runCompressLoop, createResponsesAdapter, type LoopCtx } from "../src/loop/index.ts";
+import {
+    buildCompressSystemPrompt,
+    EXPAND_OPERATION_TEXT_CLOSE,
+    EXPAND_OPERATION_TEXT_OPEN,
+    RETRIEVE_RAW_TEXT_CLOSE,
+    RETRIEVE_RAW_TEXT_OPEN,
+    WORKFLOW_TEXT_CLOSE,
+    WORKFLOW_TEXT_OPEN,
+} from "../src/compress-tool.ts";
+import { createInitialWorkflowState } from "../src/workflow/state.ts";
+import { DEFAULT_WORKFLOW_OPTIONS } from "../src/workflow/types.ts";
 
-function makeCtx(messages: CoreMessage[] = []): {
-    core: ReturnType<typeof createCore>;
-    config: Config;
-    messages: CoreMessage[];
-    session: Session;
-    log: (m: string) => void;
-    proxyUrl?: string;
-    textProtocol?: boolean;
-} {
+function makeCtx(messages: CoreMessage[] = []): LoopCtx {
     return {
         core: createCore(),
         config: { modelContextLimit: 200000 } as Config,
@@ -24,6 +26,7 @@ function makeCtx(messages: CoreMessage[] = []): {
             meta: {},
             stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
             metadata: {},
+            workflow: createInitialWorkflowState(),
             state: createInitialState(),
             createdAt: Date.now(),
             lastSeen: Date.now(),
@@ -189,4 +192,70 @@ test("loop #5: limit-hit graceful — 10 mutating rounds never degenerate empty,
     } finally {
         globalThis.fetch = orig;
     }
+});
+
+test("loop #11: workflow checkpoint executes, refreshes the request and re-requests", async () => {
+    const ctx = makeCtx();
+    ctx.workflowOptions = DEFAULT_WORKFLOW_OPTIONS;
+    ctx.session.workflow.phases.phase00001 = {
+        phaseId: "phase00001",
+        objective: "finish integration",
+        status: "CHECKPOINT_PENDING",
+        operationIds: [],
+        itemKeys: [],
+        startedAt: Date.now(),
+    };
+    ctx.session.workflow.activePhaseId = "phase00001";
+    ctx.session.workflow.checkpointQueue.push("phase00001");
+    let refreshes = 0;
+    ctx.refreshWorkflowRequest = async (requestBody) => {
+        refreshes++;
+        return { requestBody, messages: [] };
+    };
+    const args = {
+        phaseId: "phase00001",
+        completedWork: "Integrated the V2 loop.",
+        currentState: "The proxy continues after checkpointing.",
+    };
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_checkpoint", "workflow_checkpoint", JSON.stringify(args)),
+        COMPLETED,
+    ].join("");
+    const orig = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response(COMPLETED, { status: 200 });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-5", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, 1);
+        assert.equal(refreshes, 1);
+        assert.equal(Object.keys(ctx.session.workflow.checkpoints).length, 1);
+        assert.match(out, /workflow_checkpoint OK/);
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+test("responses V2 text protocol recognizes workflow retrieval markers", () => {
+    const adapter = createResponsesAdapter(true);
+    const text = [
+        `${WORKFLOW_TEXT_OPEN}{"phaseId":"phase00001"}${WORKFLOW_TEXT_CLOSE}`,
+        `${RETRIEVE_RAW_TEXT_OPEN}{"rawRef":"raw_000001"}${RETRIEVE_RAW_TEXT_CLOSE}`,
+        `${EXPAND_OPERATION_TEXT_OPEN}{"opId":"op00001"}${EXPAND_OPERATION_TEXT_CLOSE}`,
+    ].join("\n");
+    const extracted = adapter.extractTextTriggers?.(text);
+    assert.deepEqual(extracted?.calls.map((call) => call.name), [
+        "workflow_checkpoint",
+        "retrieve_raw",
+        "expand_operation",
+    ]);
+    assert.equal(extracted?.clean.trim(), "");
 });

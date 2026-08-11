@@ -1259,11 +1259,42 @@ async function forward(
             }
             reqHeaders["content-type"] = "application/json";
             const textProtocol = prepared.protocol === "responses" && !!prepared.responsesTextProtocol;
-            const systemPrompt = textProtocol ? buildCompressTextSystemPrompt() : buildCompressSystemPrompt();
+            const workflowOptions = opts.workflow ?? DEFAULT_WORKFLOW_OPTIONS;
+            const systemPrompts: string[] = [];
+            if (opts.compress.injectTool) {
+                systemPrompts.push(textProtocol ? buildCompressTextSystemPrompt() : buildCompressSystemPrompt());
+            }
+            if (workflowOptions.enabled) systemPrompts.push(buildWorkflowSystemPrompt(textProtocol));
+            const systemPrompt = systemPrompts.join("\n\n---\n\n");
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem);
             const loop = runCompressLoop(
                 streamToRead,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol, debug: opts.debug },
+                {
+                    core,
+                    config,
+                    messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages,
+                    session: prepared.session,
+                    log: ctx.log,
+                    proxyUrl,
+                    textProtocol,
+                    debug: opts.debug,
+                    workflowOptions,
+                    ...(prepared.protocol === "responses" && workflowOptions.enabled ? {
+                        refreshWorkflowRequest: async (requestBody: Record<string, unknown>) => {
+                            const refreshed = await preprocessResponsesWorkflow(
+                                requestBody as ResponsesRequestBody,
+                                prepared.session,
+                                workflowOptions,
+                                config.modelContextLimit,
+                                textProtocol,
+                            );
+                            const projection = responsesToCore(refreshed.body);
+                            attachOperationMessageRefs(prepared.session.workflow, projection.msgs);
+                            syncRequirements(prepared.session.workflow, projection.msgs, prepared.session.id);
+                            return { requestBody: { ...refreshed.body }, messages: projection.msgs };
+                        },
+                    } : {}),
+                },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders },
                 adapter,

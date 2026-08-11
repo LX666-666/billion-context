@@ -6,7 +6,7 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
-import type { Session } from "../session.js";
+import { markDirty, type Session } from "../session.js";
 import {
     parseCompressInput,
     PROXY_TOOL_NAMES,
@@ -17,6 +17,10 @@ import { buildVisibilityMarker } from "../compress-loop.js";
 import { fetchWithTimeout } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
 import { log as loggerLog } from "../logger.js";
+import { expandOperation, retrieveRawOutput } from "../workflow/archive.js";
+import { recordWorkflowCheckpoint } from "../workflow/context-gc.js";
+import { saveProjectMemory } from "../workflow/project-memory.js";
+import { DEFAULT_WORKFLOW_OPTIONS, type WorkflowOptions } from "../workflow/types.js";
 
 export const MAX_LOOP_ROUNDS = 10;
 
@@ -29,6 +33,11 @@ export interface LoopCtx {
     proxyUrl?: string;
     textProtocol?: boolean;
     debug?: boolean;
+    workflowOptions?: WorkflowOptions;
+    refreshWorkflowRequest?: (requestBody: Record<string, unknown>) => Promise<{
+        requestBody: Record<string, unknown>;
+        messages: CoreMessage[];
+    }>;
 }
 
 export interface RequestOptions {
@@ -101,6 +110,32 @@ export function executeProxyTool(
     }
     if (toolName === "acp_status") {
         return buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast);
+    }
+    if (toolName === "workflow_checkpoint") {
+        const options = ctx.workflowOptions ?? DEFAULT_WORKFLOW_OPTIONS;
+        const result = recordWorkflowCheckpoint(
+            ctx.session.workflow,
+            args,
+            options,
+            ctx.session.stats.contextTokens,
+            ctx.config.modelContextLimit,
+        );
+        if (result.includes("workflow_checkpoint OK") && options.sessionGc) {
+            saveProjectMemory(ctx.session.id, ctx.session.workflow);
+        }
+        markDirty(ctx.session);
+        return result;
+    }
+    if (toolName === "retrieve_raw") {
+        const rawRef = typeof args.rawRef === "string" ? args.rawRef : "";
+        if (!rawRef) return "[retrieve_raw FAILED: rawRef is required]";
+        const result = retrieveRawOutput(ctx.session.id, ctx.session.workflow, rawRef);
+        markDirty(ctx.session);
+        return result;
+    }
+    if (toolName === "expand_operation") {
+        const opId = typeof args.opId === "string" ? args.opId : "";
+        return opId ? expandOperation(ctx.session.workflow, opId) : "[expand_operation FAILED: opId is required]";
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }
@@ -296,7 +331,17 @@ export async function* runCompressLoop(
 
             ctx.log(`[acp-loop] round ${round} saw mutating proxy tool; re-requesting`);
 
-            const newBody = adapter.buildRequest(coreMessages, systemPrompt, requestBody);
+            let newBody = adapter.buildRequest(coreMessages, systemPrompt, requestBody);
+            const checkpointRecorded = proxyResults.some((result) =>
+                result.name === "workflow_checkpoint" && result.result.includes("workflow_checkpoint OK"),
+            );
+            if (checkpointRecorded && ctx.refreshWorkflowRequest) {
+                const refreshed = await ctx.refreshWorkflowRequest(newBody);
+                newBody = refreshed.requestBody;
+                requestBody = refreshed.requestBody;
+                coreMessages.length = 0;
+                coreMessages.push(...refreshed.messages);
+            }
             if (process.env.ACP_DUMP_REQ !== "0" && ctx.debug) {
                 try {
                     const fs = await import("node:fs");

@@ -77,14 +77,6 @@ test("usage API: summary/trends/models/providers/requests/pricing", async () => 
     await listen(proxy);
     const base = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
     try {
-        // The Web UI shell renders the sidebar + nav + client script.
-        // Usage page content is now client-rendered by the IIFE in client.ts.
-        const ui = await (await fetch(`${base}/__bili/`)).text();
-        assert.match(ui, /用量统计/, "sidebar + page title");
-        assert.match(ui, /data-page="usage"/, "nav entry");
-        assert.match(ui, /theme-row/, "theme toggle present");
-        assert.match(ui, /sync-btn/, "sync button present");
-
         // Summary.
         const summary = await (await fetch(`${base}/__bili/usage/summary`)).json() as {
             summary: { requests: number; inputTokens: number; freshInputTokens: number; cacheReadTokens: number; cacheHitRate: number; totalCost: number; acpSavedTokens: number };

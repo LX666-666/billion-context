@@ -1,7 +1,23 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToResponses, injectResponsesDeveloperMessage, patchResponsesInput, type ResponseInputItem, type ResponsesProjection } from "../responses.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
-import { ACP_TEXT_OPEN, ACP_TEXT_CLOSE, ACP_STATUS_OPEN, ACP_STATUS_CLOSE, ACP_SEARCH_OPEN, ACP_SEARCH_CLOSE, ACP_DECOMPRESS_OPEN, ACP_DECOMPRESS_CLOSE, COMPRESS_TOOL_NAME } from "../compress-tool.js";
+import {
+    ACP_TEXT_OPEN,
+    ACP_TEXT_CLOSE,
+    ACP_STATUS_OPEN,
+    ACP_STATUS_CLOSE,
+    ACP_SEARCH_OPEN,
+    ACP_SEARCH_CLOSE,
+    ACP_DECOMPRESS_OPEN,
+    ACP_DECOMPRESS_CLOSE,
+    WORKFLOW_TEXT_OPEN,
+    WORKFLOW_TEXT_CLOSE,
+    RETRIEVE_RAW_TEXT_OPEN,
+    RETRIEVE_RAW_TEXT_CLOSE,
+    EXPAND_OPERATION_TEXT_OPEN,
+    EXPAND_OPERATION_TEXT_CLOSE,
+    COMPRESS_TOOL_NAME,
+} from "../compress-tool.js";
 import type { BiliMessage } from "../bili-message.js";
 import type {
     CompressLoopAdapter,
@@ -345,6 +361,9 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 { name: "acp_status", open: ACP_STATUS_OPEN, close: ACP_STATUS_CLOSE, requirePayload: false },
                 { name: "search_context", open: ACP_SEARCH_OPEN, close: ACP_SEARCH_CLOSE, requirePayload: true },
                 { name: "decompress", open: ACP_DECOMPRESS_OPEN, close: ACP_DECOMPRESS_CLOSE, requirePayload: true },
+                { name: "workflow_checkpoint", open: WORKFLOW_TEXT_OPEN, close: WORKFLOW_TEXT_CLOSE, requirePayload: true },
+                { name: "retrieve_raw", open: RETRIEVE_RAW_TEXT_OPEN, close: RETRIEVE_RAW_TEXT_CLOSE, requirePayload: true },
+                { name: "expand_operation", open: EXPAND_OPERATION_TEXT_OPEN, close: EXPAND_OPERATION_TEXT_CLOSE, requirePayload: true },
             ];
             for (const t of triggers) {
                 let start = clean.indexOf(t.open);
