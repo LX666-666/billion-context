@@ -385,6 +385,7 @@ export async function* compressLoopAnthropicStream(
                         },
                         sessionId: ctx.session.id,
                         ctx: ctx.usage,
+                        sourceRequestId: messageId,
                         streaming: true,
                     });
                 }

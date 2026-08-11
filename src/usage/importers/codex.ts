@@ -16,8 +16,7 @@
  *   - `event_msg` with `token_count` — the cumulative snapshot we delta
  *
  * Only events whose cumulative counters advance produce a delta record.
- * The stable id is the rollout's thread id (extracted from the filename or
- * `session_meta`), making re-runs idempotent.
+ * Stable ids combine the rollout thread id and per-rollout turn index.
  */
 
 import { readdir, stat, readFile } from "node:fs/promises";
@@ -219,7 +218,7 @@ async function syncSingleFile(filePath: string): Promise<{ imported: number; ski
         if (!delta.isZero()) {
             const ts = timestamp ? Date.parse(timestamp) : Date.now();
             const sig: TokenSig = {
-                freshInput: delta.input,
+                freshInput: Math.max(0, delta.input - delta.cachedInput),
                 output: delta.output,
                 cacheRead: delta.cachedInput,
                 cacheCreation: 0,
@@ -230,6 +229,7 @@ async function syncSingleFile(filePath: string): Promise<{ imported: number; ski
             const turnRequestId = `${currentThreadId}:turn${turnIndex}`;
             const skip = await shouldSkip({
                 dataSource: DATA_SOURCE,
+                protocol: "codex",
                 sourceRequestId: turnRequestId,
                 model: currentModel,
                 sig,
@@ -243,6 +243,7 @@ async function syncSingleFile(filePath: string): Promise<{ imported: number; ski
                     model: currentModel,
                     timestamp: timestamp ?? new Date().toISOString(),
                     delta,
+                    sourceRequestId: turnRequestId,
                 });
                 await appendUsage(rec);
                 notifyAppended(rec);
@@ -305,6 +306,7 @@ function buildCodexRecord(opts: {
     model: string;
     timestamp: string;
     delta: DeltaTokens;
+    sourceRequestId: string;
 }): UsageRecord {
     // Codex/OpenAI semantics: input_tokens includes cached; fresh = input - cached.
     // The delta's `input` is the cumulative input delta, `cachedInput` the cached portion.
@@ -312,9 +314,10 @@ function buildCodexRecord(opts: {
     const rec: UsageRecord = {
         id: randomUUID(),
         timestamp: opts.timestamp,
+        sessionId: opts.threadId,
         protocol: "codex",
         dataSource: DATA_SOURCE,
-        sourceRequestId: opts.threadId,
+        sourceRequestId: opts.sourceRequestId,
         provider: "chatgpt.com",
         model: opts.model,
         inputTokens: opts.delta.input,

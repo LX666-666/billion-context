@@ -314,9 +314,11 @@ export async function* compressLoopStream(
     let activeClearTimer: (() => void) | null = null;
     try {
     const model = (requestBody.model as string) ?? "unknown";
-    let responseId = `chatcmpl-proxy-${Date.now()}`;
+    const fallbackResponseId = `chatcmpl-proxy-${Date.now()}`;
+    let responseId: string | undefined;
+    const clientResponseId = (): string => responseId ?? fallbackResponseId;
     const makeBase = () => ({
-        id: responseId,
+        id: clientResponseId(),
         object: "chat.completion.chunk" as const,
         created: Date.now(),
         model,
@@ -336,7 +338,22 @@ export async function* compressLoopStream(
         let contentText = "";
         let finishReason: string | null = null;
         let usage: Record<string, unknown> | null = null;
+        let roundResponseId: string | undefined;
         const isFirstRound = loopCount === 1;
+        const readResponseId = (eventStr: string): void => {
+            if (roundResponseId) return;
+            const dataLine = eventStr.split("\n").find((line) => line.startsWith("data:"));
+            if (!dataLine) return;
+            try {
+                const payload = JSON.parse(dataLine.slice(5).trim()) as Record<string, unknown>;
+                if (typeof payload.id === "string") {
+                    roundResponseId = payload.id;
+                    responseId ??= payload.id;
+                }
+            } catch {
+                return;
+            }
+        };
 
         const reader = upstream.getReader();
         const decoder = new TextDecoder("utf-8");
@@ -352,26 +369,18 @@ export async function* compressLoopStream(
                     const eventStr = sseBuffer.slice(0, sep);
                     sseBuffer = sseBuffer.slice(sep + 2);
                     if (!eventStr.trim()) continue;
+                    readResponseId(eventStr);
                     const d = classifySseEvent(eventStr);
                     if (d.done) {
                         continue;
                     }
                     if (isFirstRound) {
                         if (d.yieldChunk) {
-                            if (!responseId) {
-                                const dataLine = eventStr.split("\n").find((l) => l.startsWith("data:"));
-                                if (dataLine) {
-                                    try {
-                                        const p = JSON.parse(dataLine.slice(5).trim());
-                                        if (typeof p.id === "string") responseId = p.id;
-                                    } catch { /* ignore */ }
-                                }
-                            }
                             yield d.yieldChunk;
                         }
                     } else {
                         if (d.contentDelta) {
-                            yield Buffer.from(buildContentSse(responseId, model, d.contentDelta), "utf8");
+                            yield Buffer.from(buildContentSse(clientResponseId(), model, d.contentDelta), "utf8");
                         }
                     }
                     if (d.contentDelta) contentText += d.contentDelta;
@@ -401,12 +410,13 @@ export async function* compressLoopStream(
                 const eventStr = sseBuffer.slice(0, resSep);
                 sseBuffer = sseBuffer.slice(resSep + 2);
                 if (!eventStr.trim()) continue;
+                readResponseId(eventStr);
                 const d = classifySseEvent(eventStr);
                 if (d.done) continue;
                 if (isFirstRound) {
                     if (d.yieldChunk) yield d.yieldChunk;
                 } else {
-                    if (d.contentDelta) yield Buffer.from(buildContentSse(responseId, model, d.contentDelta), "utf8");
+                    if (d.contentDelta) yield Buffer.from(buildContentSse(clientResponseId(), model, d.contentDelta), "utf8");
                 }
                 if (d.contentDelta) contentText += d.contentDelta;
                 if (d.finishReason) finishReason = d.finishReason;
@@ -467,6 +477,7 @@ export async function* compressLoopStream(
                         usage,
                         sessionId: ctx.session.id,
                         ctx: ctx.usage,
+                        sourceRequestId: roundResponseId,
                         streaming: true,
                     });
                 }
@@ -490,7 +501,7 @@ export async function* compressLoopStream(
                 const preview = result.length > 120 ? result.slice(0, 120) + "..." : result;
                 ctx.log(`[acp-proxy: ${tc.name} (${tc.id}) → ${preview.replace(/\n/g, " ")}]`);
                 yield Buffer.from(
-                    buildContentSse(responseId, model, buildVisibilityMarker(tc.name, result)),
+                    buildContentSse(clientResponseId(), model, buildVisibilityMarker(tc.name, result)),
                     "utf8",
                 );
             }
@@ -529,7 +540,7 @@ export async function* compressLoopStream(
             const preview = result.length > 120 ? result.slice(0, 120) + "..." : result;
             ctx.log(`[acp-proxy: ${tc.name} (${tc.id}) → ${preview.replace(/\n/g, " ")}]`);
             yield Buffer.from(
-                buildContentSse(responseId, model, buildVisibilityMarker(tc.name, result)),
+                buildContentSse(clientResponseId(), model, buildVisibilityMarker(tc.name, result)),
                 "utf8",
             );
             messages.push({

@@ -98,6 +98,8 @@ test("proxied request with usage writes a normalized, priced ledger record", asy
         const rec = JSON.parse(lines[0]!) as UsageRecord;
         // Codex normalization: fresh = input - cached = 200; cache read = 800.
         assert.equal(rec.protocol, "codex");
+        assert.equal(rec.dataSource, "proxy");
+        assert.equal(rec.sourceRequestId, "resp_cap");
         assert.equal(rec.model, "gpt-5");
         assert.equal(rec.inputTokens, 1000);
         assert.equal(rec.freshInputTokens, 200);

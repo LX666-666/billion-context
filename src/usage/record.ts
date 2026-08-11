@@ -5,11 +5,13 @@
 
 import { randomUUID } from "node:crypto";
 import { costOf, costWithoutCache, priceFor } from "./pricing.js";
-import type { AcpUsage, NormalizedUsage, PriceEntry, Protocol, UsageRecord } from "./types.js";
+import type { AcpUsage, DataSource, NormalizedUsage, PriceEntry, Protocol, UsageRecord } from "./types.js";
 
 export type RecordContext = {
     sessionId?: string;
     protocol: Protocol;
+    dataSource?: DataSource;
+    sourceRequestId?: string;
     provider?: string;
     model?: string;
     statusCode?: number;
@@ -39,6 +41,8 @@ export function makeUsageRecord(
         timestamp: new Date().toISOString(),
         sessionId: ctx.sessionId,
         protocol: ctx.protocol,
+        dataSource: ctx.dataSource ?? "proxy",
+        sourceRequestId: ctx.sourceRequestId,
         provider: ctx.provider,
         model: ctx.model,
         inputTokens: rawInput,

@@ -159,6 +159,7 @@ async function syncSingleFile(filePath: string): Promise<{ imported: number; ski
         const sourceRequestId = `gemini_session:${sessionId}:${messageId}`;
         const skip = await shouldSkip({
             dataSource: DATA_SOURCE,
+            protocol: "openai",
             sourceRequestId,
             model,
             sig,

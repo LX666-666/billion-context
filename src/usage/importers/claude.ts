@@ -215,6 +215,7 @@ async function syncSingleFile(filePath: string): Promise<{ imported: number; ski
         };
         const skip = await shouldSkip({
             dataSource: DATA_SOURCE,
+            protocol: "anthropic",
             sourceRequestId: msg.messageId,
             model: msg.model,
             sig,

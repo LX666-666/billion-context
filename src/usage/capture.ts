@@ -11,6 +11,7 @@ import { normalizeUsage } from "./normalizer.js";
 import { appendUsage } from "./store.js";
 import { makeUsageRecord } from "./record.js";
 import { resolvePrice } from "./pricing.js";
+import { notifyAppended, shouldSkip } from "./importers/dedup.js";
 import type { AcpUsage, Protocol, UsageRecord } from "./types.js";
 
 /** Minimal per-request context threaded into the capture point. */
@@ -25,6 +26,7 @@ export type CaptureOptions = {
     usage: unknown;
     sessionId: string;
     ctx: UsageCaptureCtx;
+    sourceRequestId?: string;
     /** ACP compression outcome for this request (best-effort estimate). */
     acp?: AcpUsage;
     statusCode?: number;
@@ -43,6 +45,8 @@ export async function captureUsage(opts: CaptureOptions): Promise<UsageRecord | 
     const rec = makeUsageRecord(normalized, opts.acp, {
         sessionId: opts.sessionId,
         protocol: opts.protocol,
+        dataSource: "proxy",
+        sourceRequestId: opts.sourceRequestId,
         provider: opts.ctx.provider,
         model: opts.ctx.model,
         statusCode: opts.statusCode,
@@ -50,6 +54,21 @@ export async function captureUsage(opts: CaptureOptions): Promise<UsageRecord | 
         latencyMs: opts.latencyMs,
         ttftMs: opts.ttftMs,
     }, price);
+    const skip = await shouldSkip({
+        dataSource: "proxy",
+        protocol: opts.protocol,
+        sourceRequestId: opts.sourceRequestId,
+        model: opts.ctx.model,
+        sig: {
+            freshInput: rec.freshInputTokens,
+            output: rec.outputTokens,
+            cacheRead: rec.cacheReadTokens,
+            cacheCreation: rec.cacheCreationTokens,
+        },
+        timestamp: Date.parse(rec.timestamp),
+    });
+    if (skip) return undefined;
     await appendUsage(rec);
+    notifyAppended(rec);
     return rec;
 }

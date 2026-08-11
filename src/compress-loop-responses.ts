@@ -680,6 +680,7 @@ export async function* compressLoopResponsesStream(
                                     usage,
                                     sessionId: ctx.session.id,
                                     ctx: ctx.usage,
+                                    sourceRequestId: typeof resp.id === "string" ? resp.id : undefined,
                                     acp,
                                     streaming: true,
                                 });

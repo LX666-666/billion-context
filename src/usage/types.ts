@@ -67,7 +67,7 @@ export type UsageRecord = {
     dataSource?: DataSource;
     /**
      * Stable identifier from the source protocol (Claude `message.id`,
-     * Codex thread id, Grok `prompt_id`, etc.). Used as the primary
+     * Codex thread/turn id, Grok `prompt_id`, etc.). Used as the primary
      * cross-source dedup key when present.
      */
     sourceRequestId?: string;

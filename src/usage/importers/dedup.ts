@@ -6,21 +6,19 @@
  * physical API request may appear in both, so we dedup.
  *
  * Strategy (matching cc-switch `should_skip_session_insert`):
- *   1. Primary key: the protocol-stable id (`sourceRequestId`) — Claude
- *      `message.id`, Codex thread id, Grok `prompt_id`. Same id → skip.
- *   2. Conservative fallback when no stable id: a tuple of
- *      (dataSource, model, token-signature, ±SETTLE_WINDOW seconds).
- *      This only fires when both records lack a stable id; we never
- *      aggressively merge two real distinct requests.
+ *   1. Primary key: `(protocol, sourceRequestId)`.
+ *   2. Conservative fallback: protocol, normalized model, the four billing
+ *      dimensions, and a ±SETTLE_WINDOW timestamp match.
+ *   3. Tuple fallback only merges proxy ↔ session records.
  *
  * The index is a snapshot of what's already in the ledger. It is rebuilt
  * lazily on first access and updated as the ledger grows.
  */
 
-import { readdir, readFile, open, stat } from "node:fs/promises";
+import { open, stat } from "node:fs/promises";
 import path from "node:path";
 import { usageFile } from "../store.js";
-import type { UsageRecord } from "../types.js";
+import type { Protocol, UsageRecord } from "../types.js";
 
 /** Window in ms during which a proxy record suppresses a session import of
  *  the same logical request (and vice versa). 5 minutes matches cc-switch. */
@@ -34,17 +32,17 @@ export type TokenSig = {
     cacheCreation: number;
 };
 
-export type DedupKey = {
+type TupleEntry = {
     dataSource: string;
     model: string;
-    sig: TokenSig;
     timestamp: number;
 };
 
 let stableIndex: Set<string> | undefined;
-let tupleIndex: Map<string, number[]> | undefined;
+let tupleIndex: Map<string, TupleEntry[]> | undefined;
 let indexedSize = 0;
 let indexedFile = "";
+let indexLock: Promise<void> = Promise.resolve();
 
 function usageFilePath(): string {
     const env = process.env.BILI_USAGE_FILE;
@@ -53,6 +51,20 @@ function usageFilePath(): string {
 
 /** Build (or extend) the in-memory dedup index from the ledger file. */
 async function ensureIndex(): Promise<void> {
+    const previous = indexLock;
+    let release: () => void = () => {};
+    indexLock = new Promise<void>((resolve) => {
+        release = resolve;
+    });
+    await previous;
+    try {
+        await ensureIndexLocked();
+    } finally {
+        release();
+    }
+}
+
+async function ensureIndexLocked(): Promise<void> {
     const file = usageFilePath();
     let size = 0;
     try {
@@ -94,11 +106,8 @@ async function ensureIndex(): Promise<void> {
 /** Insert one record into the in-memory index. */
 function indexRecord(rec: UsageRecord): void {
     const ds = rec.dataSource ?? "proxy";
-    const model = rec.model ?? "";
     if (rec.sourceRequestId) {
-        // Key by dataSource + stable id so that proxy and session with
-        // the same protocol id still dedup correctly.
-        stableIndex!.add(`${ds}:${rec.sourceRequestId}`);
+        stableIndex!.add(stableKey(rec.protocol, rec.sourceRequestId));
     }
     const ts = Date.parse(rec.timestamp);
     if (Number.isNaN(ts)) return;
@@ -108,25 +117,47 @@ function indexRecord(rec: UsageRecord): void {
         cacheRead: rec.cacheReadTokens,
         cacheCreation: rec.cacheCreationTokens,
     };
-    const tupleKey = tupleKeyOf({ dataSource: ds, model, sig, timestamp: ts });
+    const tupleKey = tupleKeyOf(rec.protocol, sig);
     const arr = tupleIndex!.get(tupleKey) ?? [];
-    arr.push(ts);
+    arr.push({ dataSource: ds, model: normalizeModel(rec.model), timestamp: ts });
     tupleIndex!.set(tupleKey, arr);
 }
 
-function tupleKeyOf(k: DedupKey): string {
-    return `${k.dataSource}|${k.model}|${k.sig.freshInput}|${k.sig.output}|${k.sig.cacheRead}|${k.sig.cacheCreation}`;
+function stableKey(protocol: Protocol, sourceRequestId: string): string {
+    return `${protocol}|${sourceRequestId}`;
+}
+
+function tupleKeyOf(protocol: Protocol, sig: TokenSig): string {
+    return `${protocol}|${sig.freshInput}|${sig.output}|${sig.cacheRead}|${sig.cacheCreation}`;
+}
+
+function normalizeModel(model?: string): string {
+    const normalized = model?.trim().toLowerCase() || "unknown";
+    const withoutDate = normalized.replace(
+        /(?:[-_.]?20\d{2}[-_.]?(?:0[1-9]|1[0-2])[-_.]?(?:0[1-9]|[12]\d|3[01]))$/u,
+        "",
+    );
+    return withoutDate.replace(/[-_.]+$/u, "") || "unknown";
+}
+
+function modelsCompatible(left: string, right: string): boolean {
+    return left === right || left === "unknown" || right === "unknown";
+}
+
+function isCrossSourcePair(left: string, right: string): boolean {
+    return (left === "proxy") !== (right === "proxy");
 }
 
 /** Decide whether a candidate record should be skipped because the ledger
  *  already has it. Returns the reason, or `undefined` if it's new.
  *
- *  Stable-id check: same `(dataSource, sourceRequestId)` already indexed.
- *  Tuple check: an existing record with the same token signature tuple
- *  lies within ±SETTLE_WINDOW_MS of the candidate's timestamp.
+ *  Stable-id check: same `(protocol, sourceRequestId)` already indexed.
+ *  Tuple check: a proxy/session counterpart with compatible model and token
+ *  signature lies within ±SETTLE_WINDOW_MS of the candidate timestamp.
  */
 export async function shouldSkip(candidate: {
     dataSource: string;
+    protocol: Protocol;
     sourceRequestId?: string;
     model?: string;
     sig: TokenSig;
@@ -135,20 +166,19 @@ export async function shouldSkip(candidate: {
     await ensureIndex();
     const ds = candidate.dataSource;
     if (candidate.sourceRequestId) {
-        const key = `${ds}:${candidate.sourceRequestId}`;
+        const key = stableKey(candidate.protocol, candidate.sourceRequestId);
         if (stableIndex!.has(key)) return `duplicate-stable:${key}`;
     }
-    const model = candidate.model ?? "";
-    const tupleKey = tupleKeyOf({
-        dataSource: ds,
-        model,
-        sig: candidate.sig,
-        timestamp: candidate.timestamp,
-    });
+    const model = normalizeModel(candidate.model);
+    const tupleKey = tupleKeyOf(candidate.protocol, candidate.sig);
     const existing = tupleIndex!.get(tupleKey);
     if (existing) {
-        for (const ts of existing) {
-            if (Math.abs(ts - candidate.timestamp) <= SETTLE_WINDOW_MS) {
+        for (const entry of existing) {
+            if (
+                isCrossSourcePair(entry.dataSource, ds)
+                && modelsCompatible(entry.model, model)
+                && Math.abs(entry.timestamp - candidate.timestamp) <= SETTLE_WINDOW_MS
+            ) {
                 return `duplicate-tuple:${tupleKey}`;
             }
         }
@@ -169,4 +199,5 @@ export function _resetDedupIndexForTest(): void {
     tupleIndex = undefined;
     indexedSize = 0;
     indexedFile = "";
+    indexLock = Promise.resolve();
 }

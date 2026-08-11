@@ -1468,6 +1468,7 @@ async function forward(
                             usage: u,
                             sessionId: prepared.session.id,
                             ctx: usageCapture,
+                            sourceRequestId: typeof json.id === "string" ? json.id : undefined,
                             streaming: false,
                         });
                     }

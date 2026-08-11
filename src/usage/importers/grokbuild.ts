@@ -190,6 +190,7 @@ async function syncSingleFile(filePath: string): Promise<{ imported: number; ski
             const sourceRequestId = `grok_session:${sessionId}:${turnKey}:${model}`;
             const skip = await shouldSkip({
                 dataSource: DATA_SOURCE,
+                protocol: "openai",
                 sourceRequestId,
                 model,
                 sig,
