@@ -1,8 +1,9 @@
 import { buildStatusReport, collectBlockContent, estimateTokensFast, type CompressionCore, type Config, type CoreMessage, type CompressionState } from "acp-kernel";
-import { type Session, cacheBlockContent } from "./session.js";
+import { type Session, cacheBlockContent, markDirty } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { resolveDecompress } from "./decompress-shared.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
+import { expandOperation, retrieveRawOutput } from "./workflow/archive.js";
 
 export type RewriteCtx = {
     core: CompressionCore;
@@ -183,10 +184,8 @@ function emitToolReplacement(toolName: string, jsonInput: string, ctx: RewriteCt
     );
 }
 
-// Dispatch all four ACP proxy tools to the same logic the OpenAI/Responses
-// path uses (compress-loop.ts executeProxyTool). compress mutates context
-// (handled by applyRanges); the other three are read-only queries whose result
-// is emitted as a text delta replacing the intercepted tool_use block.
+// Dispatch all six context proxy tools to the same logic the OpenAI/Responses
+// path uses (compress-loop.ts executeProxyTool).
 function executeAnthropicProxyTool(toolName: string, args: Record<string, unknown>, ctx: RewriteCtx): string {
     if (toolName === COMPRESS_TOOL_NAME) {
         return applyRanges(parseCompressInput(args), ctx);
@@ -209,6 +208,17 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
     }
     if (toolName === "acp_status") {
         return buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast);
+    }
+    if (toolName === "retrieve_raw") {
+        const rawRef = typeof args.rawRef === "string" ? args.rawRef : "";
+        if (!rawRef) return "[retrieve_raw FAILED: rawRef is required]";
+        const result = retrieveRawOutput(ctx.session.id, ctx.session.workflow, rawRef);
+        markDirty(ctx.session);
+        return result;
+    }
+    if (toolName === "expand_operation") {
+        const opId = typeof args.opId === "string" ? args.opId : "";
+        return opId ? expandOperation(ctx.session.workflow, opId) : "[expand_operation FAILED: opId is required]";
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }

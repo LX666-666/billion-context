@@ -6,6 +6,8 @@ import { sessionsDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { createInitialState, type CompressionState } from "acp-kernel";
 import type { Session, BlockContent } from "./session.js";
+import { mergeWorkflowState } from "./workflow/state.js";
+import type { WorkflowState } from "./workflow/types.js";
 
 /**
  * On-disk persistence for proxy sessions.
@@ -47,7 +49,7 @@ import type { Session, BlockContent } from "./session.js";
  *    lock should be added before promoting multi-agent concurrency as safe.
  */
 
-const PERSIST_VERSION = 2;
+const PERSIST_VERSION = 3;
 
 interface PersistedSession {
     version: number;
@@ -75,6 +77,7 @@ interface PersistedSession {
     };
     /** Free-form escape hatch (v2+). */
     metadata?: Record<string, unknown>;
+    workflow?: WorkflowState;
     createdAt: number;
     // Legacy flat fields (v1). Kept optional only so buildSession can read
     // older files; v2 records emit grouped meta/stats instead.
@@ -427,6 +430,7 @@ function buildRecord(session: Session): PersistedSession {
         meta: { ...session.meta },
         stats: { ...session.stats },
         metadata: { ...session.metadata },
+        workflow: session.workflow,
         state: session.state,
         blockContents: Object.fromEntries(session.blockContents),
         createdAt: session.createdAt,
@@ -460,6 +464,7 @@ function buildSession(parsed: PersistedSession): Session {
             contextTokens: stats.contextTokens ?? parsed.contextTokens ?? 0,
         },
         metadata: parsed.metadata ?? {},
+        workflow: mergeWorkflowState(parsed.workflow),
         state: mergeState(parsed.state),
         createdAt: parsed.createdAt ?? Date.now(),
         lastSeen: Date.now(),

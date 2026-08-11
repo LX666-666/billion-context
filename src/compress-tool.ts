@@ -6,7 +6,7 @@ export const COMPRESS_TOOL_NAME = "compress";
 /** Text-protocol trigger tags. The model emits these in its text output to
  *  request compression (used when host client tools cannot coexist with a
  *  declared `tools` field — e.g. OpenAI Codex code_mode). Distinct from the
- *  `<acp tokens=...>` history tags so they never collide. */
+ *  `\x3cacp tokens=...\x3e` history tags so they never collide. */
 export const ACP_TEXT_OPEN = "\x3cacp_compress\x3e";
 export const ACP_TEXT_CLOSE = "\x3c/acp_compress\x3e";
 export const ACP_STATUS_OPEN = "\x3cacp_status\x3e";
@@ -15,6 +15,12 @@ export const ACP_SEARCH_OPEN = "\x3cacp_search\x3e";
 export const ACP_SEARCH_CLOSE = "\x3c/acp_search\x3e";
 export const ACP_DECOMPRESS_OPEN = "\x3cacp_decompress\x3e";
 export const ACP_DECOMPRESS_CLOSE = "\x3c/acp_decompress\x3e";
+export const WORKFLOW_TEXT_OPEN = "\x3cworkflow_checkpoint\x3e";
+export const WORKFLOW_TEXT_CLOSE = "\x3c/workflow_checkpoint\x3e";
+export const RETRIEVE_RAW_TEXT_OPEN = "\x3cretrieve_raw\x3e";
+export const RETRIEVE_RAW_TEXT_CLOSE = "\x3c/retrieve_raw\x3e";
+export const EXPAND_OPERATION_TEXT_OPEN = "\x3cexpand_operation\x3e";
+export const EXPAND_OPERATION_TEXT_CLOSE = "\x3c/expand_operation\x3e";
 
 export const COMPRESS_TOOL = {
     name: COMPRESS_TOOL_NAME,
@@ -126,16 +132,18 @@ ${HOW_TO_COMPRESS_RULES}
 
 ACP TAGS
 
-Each message in the conversation is annotated with a <acp tokens="2.1K" type="tool:bash">m00175</acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata injected by the proxy. NEVER echo, repeat, or reference these XML tags in your responses — the tags must not appear in your output. Use only the ref ID (e.g. m00005) inside compress calls, never the XML wrapper. The token size is approximate — treat it as a relative guide, not an exact count.
+Each message in the conversation is annotated with a \x3cacp tokens="2.1K" type="tool:bash"\x3em00175\x3c/acp\x3e tag showing its reference ID, approximate token size, and content type. These tags are system metadata injected by the proxy. NEVER echo, repeat, or reference these XML tags in your responses — the tags must not appear in your output. Use only the ref ID (e.g. m00005) inside compress calls, never the XML wrapper. The token size is approximate — treat it as a relative guide, not an exact count.
 
 TOOLS
 
-You have five context-management tools:
+You have six context-management tools:
 
 - compress — Replace a contiguous range of older conversation with a single detailed summary you write. Use when content is genuinely consumed (no longer needed for the current task step). Single range: compress({ topic: "...", content: [{ startId: "m00150", endId: "m00220", summary: "..." }] }). Batch (multiple unrelated ranges, each with its own topic): compress({ content: [{ topic: "Auth", startId: "m00150", endId: "m00220", summary: "..." }, { topic: "Deploy", startId: "m00300", endId: "m00350", summary: "..." }] }).
 - decompress — Restore a previously compressed block's content. By default restores one tier up (T2→T1 summaries, not raw messages). Use full: true to restore all the way to original messages. Use toFile to write to file instead of inflating context. Example: decompress({ blockId: "b5" }) or decompress({ blockId: "b5", toFile: "path" }) or decompress({ blockId: "b5", full: true }).
 - search_context — Search compressed block summaries (and optionally visible messages) by keyword. Use BEFORE decompressing to find the right block. Example: search_context({ query: "auth token refresh" }).
 - acp_status — Context status with compressible ranges. No args = overview + ranges. Use to find what to compress next.
+- retrieve_raw — Restore an exact pre-ingest-pruned tool output by raw_ref.
+- expand_operation — Inspect an opNNNNN operation's type, phase, command, lifecycle and message refs.
 
 COMPRESSION SUMMARIES IN CONTEXT
 
@@ -158,7 +166,7 @@ ${HOW_TO_COMPRESS_RULES}
 
 ACP TAGS
 
-Each message in the conversation is annotated with a <acp tokens="2.1K" type="tool:bash">m00175</acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.
+Each message in the conversation is annotated with a \x3cacp tokens="2.1K" type="tool:bash"\x3em00175\x3c/acp\x3e tag showing its reference ID, approximate token size, and content type. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.
 
 COMPRESSION PROTOCOL (TEXT)
 
@@ -250,18 +258,57 @@ export const ACP_STATUS_TOOL_OPENAI = {
     },
 };
 
-export const ACP_TOOLS_OPENAI = [
+export const RETRIEVE_RAW_TOOL_NAME = "retrieve_raw";
+export const EXPAND_OPERATION_TOOL_NAME = "expand_operation";
+
+const RETRIEVE_RAW_PARAMETERS = {
+    type: "object",
+    properties: { rawRef: { type: "string" } },
+    required: ["rawRef"],
+};
+
+const EXPAND_OPERATION_PARAMETERS = {
+    type: "object",
+    properties: { opId: { type: "string" } },
+    required: ["opId"],
+};
+
+export const RETRIEVE_RAW_TOOL_OPENAI = {
+    type: "function" as const,
+    function: {
+        name: RETRIEVE_RAW_TOOL_NAME,
+        description: "Restore an exact archived semantic tool output by raw_ref.",
+        parameters: RETRIEVE_RAW_PARAMETERS,
+    },
+};
+
+export const EXPAND_OPERATION_TOOL_OPENAI = {
+    type: "function" as const,
+    function: {
+        name: EXPAND_OPERATION_TOOL_NAME,
+        description: "Show the tracked metadata and references for a workflow operation.",
+        parameters: EXPAND_OPERATION_PARAMETERS,
+    },
+};
+
+export const ACP_COMPRESSION_TOOLS_OPENAI = [
     COMPRESS_TOOL_OPENAI,
     DECOMPRESS_TOOL_OPENAI,
     SEARCH_CONTEXT_TOOL_OPENAI,
     ACP_STATUS_TOOL_OPENAI,
 ] as const;
 
-/** Anthropic-format tools (name + description + input_schema). The Anthropic
- *  request path (ZCode, Claude Code) injects all four so the model can actually
- *  call compress/decompress/search_context/acp_status — previously only
- *  COMPRESS_TOOL was injected while the system prompt described all four,
- *  leaving the model able to see the tool docs but unable to call them. */
+export const ACP_WORKFLOW_TOOLS_OPENAI = [
+    RETRIEVE_RAW_TOOL_OPENAI,
+    EXPAND_OPERATION_TOOL_OPENAI,
+] as const;
+
+export const ACP_TOOLS_OPENAI = [
+    ...ACP_COMPRESSION_TOOLS_OPENAI,
+    ...ACP_WORKFLOW_TOOLS_OPENAI,
+] as const;
+
+/** Anthropic-format tools (name + description + input_schema). */
 export const DECOMPRESS_TOOL = {
     name: DECOMPRESS_TOOL_NAME,
     description: DECOMPRESS_TOOL_OPENAI.function.description,
@@ -280,11 +327,33 @@ export const ACP_STATUS_TOOL = {
     input_schema: ACP_STATUS_TOOL_OPENAI.function.parameters,
 };
 
-export const ACP_TOOLS_ANTHROPIC = [
+export const RETRIEVE_RAW_TOOL = {
+    name: RETRIEVE_RAW_TOOL_NAME,
+    description: RETRIEVE_RAW_TOOL_OPENAI.function.description,
+    input_schema: RETRIEVE_RAW_PARAMETERS,
+};
+
+export const EXPAND_OPERATION_TOOL = {
+    name: EXPAND_OPERATION_TOOL_NAME,
+    description: EXPAND_OPERATION_TOOL_OPENAI.function.description,
+    input_schema: EXPAND_OPERATION_PARAMETERS,
+};
+
+export const ACP_COMPRESSION_TOOLS_ANTHROPIC = [
     COMPRESS_TOOL,
     DECOMPRESS_TOOL,
     SEARCH_CONTEXT_TOOL,
     ACP_STATUS_TOOL,
+] as const;
+
+export const ACP_WORKFLOW_TOOLS_ANTHROPIC = [
+    RETRIEVE_RAW_TOOL,
+    EXPAND_OPERATION_TOOL,
+] as const;
+
+export const ACP_TOOLS_ANTHROPIC = [
+    ...ACP_COMPRESSION_TOOLS_ANTHROPIC,
+    ...ACP_WORKFLOW_TOOLS_ANTHROPIC,
 ] as const;
 
 // Anthropic format tool constants (defined below, after DECOMPRESS_TOOL_OPENAI etc.)
@@ -316,12 +385,87 @@ export const ACP_STATUS_TOOL_RESPONSES = {
     parameters: ACP_STATUS_TOOL_OPENAI.function.parameters,
 };
 
-/** All ACP tools in Responses API flat format, matching PROXY_TOOL_NAMES. */
-export const ACP_TOOLS_RESPONSES = [
+export const WORKFLOW_CHECKPOINT_TOOL_RESPONSES = {
+    type: "function" as const,
+    name: "workflow_checkpoint",
+    description: "Record a completed coding phase before its working history is garbage-collected.",
+    parameters: {
+        type: "object",
+        properties: {
+            phaseId: { type: "string" },
+            objective: { type: "string" },
+            requirementState: { type: "string" },
+            requirementUpdates: {
+                type: "array",
+                items: {
+                    type: "object",
+                    properties: {
+                        id: { type: "string" },
+                        status: { type: "string", enum: ["ACTIVE", "SATISFIED", "SUPERSEDED", "CANCELLED"] },
+                        supersededBy: { type: "string" },
+                    },
+                    required: ["id", "status"],
+                },
+            },
+            completedWork: { type: "string" },
+            changedFiles: { type: "array", items: { type: "string" } },
+            currentState: { type: "string" },
+            decisions: {
+                type: "array",
+                items: {
+                    type: "object",
+                    properties: {
+                        decision: { type: "string" },
+                        reason: { type: "string" },
+                        refs: { type: "array", items: { type: "string" } },
+                    },
+                    required: ["decision", "reason"],
+                },
+            },
+            rejectedApproaches: { type: "array", items: { type: "string" } },
+            failedAttempts: { type: "array", items: { type: "string" } },
+            validation: { type: "array", items: { type: "string" } },
+            blockers: { type: "array", items: { type: "string" } },
+            unresolvedIssues: { type: "array", items: { type: "string" } },
+            nextAction: { type: "string" },
+            criticalRefs: { type: "array", items: { type: "string" } },
+            keepRefs: { type: "array", items: { type: "string" } },
+        },
+        required: ["phaseId", "completedWork", "currentState"],
+    },
+};
+
+export const RETRIEVE_RAW_TOOL_RESPONSES = {
+    type: "function" as const,
+    name: RETRIEVE_RAW_TOOL_NAME,
+    description: RETRIEVE_RAW_TOOL_OPENAI.function.description,
+    parameters: RETRIEVE_RAW_PARAMETERS,
+};
+
+export const EXPAND_OPERATION_TOOL_RESPONSES = {
+    type: "function" as const,
+    name: EXPAND_OPERATION_TOOL_NAME,
+    description: EXPAND_OPERATION_TOOL_OPENAI.function.description,
+    parameters: EXPAND_OPERATION_PARAMETERS,
+};
+
+/** Compression tools in Responses API flat format. */
+export const ACP_CONTEXT_TOOLS_RESPONSES = [
     COMPRESS_TOOL_RESPONSES,
     DECOMPRESS_TOOL_RESPONSES,
     SEARCH_CONTEXT_TOOL_RESPONSES,
     ACP_STATUS_TOOL_RESPONSES,
+] as const;
+
+export const WORKFLOW_TOOLS_RESPONSES = [
+    WORKFLOW_CHECKPOINT_TOOL_RESPONSES,
+    RETRIEVE_RAW_TOOL_RESPONSES,
+    EXPAND_OPERATION_TOOL_RESPONSES,
+] as const;
+
+export const ACP_TOOLS_RESPONSES = [
+    ...ACP_CONTEXT_TOOLS_RESPONSES,
+    ...WORKFLOW_TOOLS_RESPONSES,
 ] as const;
 
 export const PROXY_TOOL_NAMES: ReadonlySet<string> = new Set([
@@ -329,6 +473,13 @@ export const PROXY_TOOL_NAMES: ReadonlySet<string> = new Set([
     DECOMPRESS_TOOL_NAME,
     SEARCH_CONTEXT_TOOL_NAME,
     ACP_STATUS_TOOL_NAME,
+    RETRIEVE_RAW_TOOL_NAME,
+    EXPAND_OPERATION_TOOL_NAME,
+]);
+
+export const RESPONSES_PROXY_TOOL_NAMES: ReadonlySet<string> = new Set([
+    ...PROXY_TOOL_NAMES,
+    "workflow_checkpoint",
 ]);
 
 /** compress/decompress: mutate history → must drive the compress loop (their
@@ -336,6 +487,7 @@ export const PROXY_TOOL_NAMES: ReadonlySet<string> = new Set([
 export const MUTATING_PROXY_TOOLS: ReadonlySet<string> = new Set([
     COMPRESS_TOOL_NAME,
     DECOMPRESS_TOOL_NAME,
+    "workflow_checkpoint",
 ]);
 
 /** acp_status/search_context: read-only → must NOT loop. Looping them made the
@@ -343,4 +495,6 @@ export const MUTATING_PROXY_TOOLS: ReadonlySet<string> = new Set([
 export const READONLY_PROXY_TOOLS: ReadonlySet<string> = new Set([
     SEARCH_CONTEXT_TOOL_NAME,
     ACP_STATUS_TOOL_NAME,
+    RETRIEVE_RAW_TOOL_NAME,
+    EXPAND_OPERATION_TOOL_NAME,
 ]);

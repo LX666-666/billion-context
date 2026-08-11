@@ -7,14 +7,41 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
-import type { Session } from "./session.js";
-import { parseCompressInput, PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS, READONLY_PROXY_TOOLS, COMPRESS_TOOL_NAME, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
+import { markDirty, type Session } from "./session.js";
+import {
+    parseCompressInput,
+    RESPONSES_PROXY_TOOL_NAMES,
+    MUTATING_PROXY_TOOLS,
+    READONLY_PROXY_TOOLS,
+    COMPRESS_TOOL_NAME,
+    ACP_TEXT_OPEN,
+    ACP_TEXT_CLOSE,
+    ACP_STATUS_OPEN,
+    ACP_STATUS_CLOSE,
+    ACP_SEARCH_OPEN,
+    ACP_SEARCH_CLOSE,
+    ACP_DECOMPRESS_OPEN,
+    ACP_DECOMPRESS_CLOSE,
+    WORKFLOW_TEXT_OPEN,
+    WORKFLOW_TEXT_CLOSE,
+    RETRIEVE_RAW_TEXT_OPEN,
+    RETRIEVE_RAW_TEXT_CLOSE,
+    EXPAND_OPERATION_TEXT_OPEN,
+    EXPAND_OPERATION_TEXT_CLOSE,
+} from "./compress-tool.js";
 import { log as loggerLog } from "./logger.js";
 import { applyRanges } from "./stream.js";
 import { resolveDecompress } from "./decompress-shared.js";
 import { buildVisibilityMarker } from "./compress-loop.js";
 import { fetchWithTimeout } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
+import { captureUsage, type UsageCaptureCtx } from "./usage/capture.js";
+import { expandOperation, retrieveRawOutput } from "./workflow/archive.js";
+import { recordWorkflowCheckpoint } from "./workflow/context-gc.js";
+import { DEFAULT_WORKFLOW_OPTIONS, type WorkflowOptions } from "./workflow/types.js";
+import { saveProjectMemory } from "./workflow/project-memory.js";
+import { preprocessResponsesWorkflow } from "./workflow/responses-preprocessor.js";
+import type { ResponsesRequestBody } from "./responses.js";
 
 /** Text-protocol mode: the host (OpenAI Codex code_mode) cannot coexist with
  *  a declared `tools` array, so compression is triggered by a text marker the
@@ -25,20 +52,38 @@ const TEXT_PROTOCOL = process.env.ACP_COMPRESS_PROTOCOL === "text";
  *  Returns the cleaned text (trigger removed) and synthesized function-call
  *  accumulators so the existing compress loop can execute them like real tool
  *  calls and loop again with the result. */
-function extractTextTriggers(text: string): { clean: string; calls: FunctionCallAccumulator[] } {
+const TEXT_TRIGGERS = [
+    { open: ACP_TEXT_OPEN, close: ACP_TEXT_CLOSE, name: COMPRESS_TOOL_NAME },
+    { open: ACP_STATUS_OPEN, close: ACP_STATUS_CLOSE, name: "acp_status" },
+    { open: ACP_SEARCH_OPEN, close: ACP_SEARCH_CLOSE, name: "search_context" },
+    { open: ACP_DECOMPRESS_OPEN, close: ACP_DECOMPRESS_CLOSE, name: "decompress" },
+    { open: WORKFLOW_TEXT_OPEN, close: WORKFLOW_TEXT_CLOSE, name: "workflow_checkpoint" },
+    { open: RETRIEVE_RAW_TEXT_OPEN, close: RETRIEVE_RAW_TEXT_CLOSE, name: "retrieve_raw" },
+    { open: EXPAND_OPERATION_TEXT_OPEN, close: EXPAND_OPERATION_TEXT_CLOSE, name: "expand_operation" },
+] as const;
+
+export function extractTextTriggers(text: string): { clean: string; calls: FunctionCallAccumulator[] } {
     const calls: FunctionCallAccumulator[] = [];
     let clean = "";
     let i = 0;
     let n = 0;
     while (i < text.length) {
-        const open = text.indexOf(ACP_TEXT_OPEN, i);
-        if (open === -1) {
+        let selected: (typeof TEXT_TRIGGERS)[number] | undefined;
+        let open = -1;
+        for (const trigger of TEXT_TRIGGERS) {
+            const candidate = text.indexOf(trigger.open, i);
+            if (candidate >= 0 && (open < 0 || candidate < open)) {
+                selected = trigger;
+                open = candidate;
+            }
+        }
+        if (!selected || open === -1) {
             clean += text.slice(i);
             break;
         }
         clean += text.slice(i, open);
-        const after = open + ACP_TEXT_OPEN.length;
-        const close = text.indexOf(ACP_TEXT_CLOSE, after);
+        const after = open + selected.open.length;
+        const close = text.indexOf(selected.close, after);
         if (close === -1) {
             // malformed/incomplete trigger — pass through as plain text
             clean += text.slice(open);
@@ -50,11 +95,11 @@ function extractTextTriggers(text: string): { clean: string; calls: FunctionCall
             calls.push({
                 itemId: `fc_text_${stamp}`,
                 callId: `call_text_${stamp}`,
-                name: COMPRESS_TOOL_NAME,
+                name: selected.name,
                 arguments: payload,
             });
         }
-        i = close + ACP_TEXT_CLOSE.length;
+        i = close + selected.close.length;
     }
     return { clean, calls };
 }
@@ -68,6 +113,9 @@ interface CompressLoopResponsesCtx {
     /** Resolved upstream proxy URL (http://host:port) or undefined for direct. */
     proxyUrl?: string;
     textProtocol?: boolean;
+    /** Usage-ledger capture context (model/provider). Omitted = no ledger. */
+    usage?: UsageCaptureCtx;
+    workflowOptions?: WorkflowOptions;
 }
 
 interface RequestOptions {
@@ -109,7 +157,49 @@ function executeProxyTool(
     if (toolName === "acp_status") {
         return buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast);
     }
+    if (toolName === "workflow_checkpoint") {
+        const result = recordWorkflowCheckpoint(
+            ctx.session.workflow,
+            args,
+            ctx.workflowOptions ?? DEFAULT_WORKFLOW_OPTIONS,
+            ctx.session.stats.contextTokens,
+            ctx.config.modelContextLimit,
+        );
+        const workflowOptions = ctx.workflowOptions ?? DEFAULT_WORKFLOW_OPTIONS;
+        if (result.includes("workflow_checkpoint OK") && workflowOptions.sessionGc) {
+            saveProjectMemory(ctx.session.id, ctx.session.workflow);
+        }
+        markDirty(ctx.session);
+        return result;
+    }
+    if (toolName === "retrieve_raw") {
+        const rawRef = typeof args.rawRef === "string" ? args.rawRef : "";
+        if (!rawRef) return "[retrieve_raw FAILED: rawRef is required]";
+        const result = retrieveRawOutput(ctx.session.id, ctx.session.workflow, rawRef);
+        markDirty(ctx.session);
+        return result;
+    }
+    if (toolName === "expand_operation") {
+        const opId = typeof args.opId === "string" ? args.opId : "";
+        if (!opId) return "[expand_operation FAILED: opId is required]";
+        return expandOperation(ctx.session.workflow, opId);
+    }
     return `[Unknown proxy tool: ${toolName}]`;
+}
+
+async function refreshWorkflowRequest(
+    requestBody: Record<string, unknown>,
+    ctx: CompressLoopResponsesCtx,
+    textProtocol: boolean,
+): Promise<void> {
+    const refreshed = await preprocessResponsesWorkflow(
+        requestBody as ResponsesRequestBody,
+        ctx.session,
+        ctx.workflowOptions ?? DEFAULT_WORKFLOW_OPTIONS,
+        ctx.config.modelContextLimit,
+        textProtocol,
+    );
+    requestBody.input = refreshed.body.input;
 }
 
 function extractEventType(rawEvent: string): string | null {
@@ -395,12 +485,13 @@ export async function compressLoopResponsesJson(
     requestOptions: RequestOptions,
 ): Promise<Record<string, unknown>> {
     let current = initialResponse;
+    const textProtocol = ctx.textProtocol ?? TEXT_PROTOCOL;
     for (let loopCount = 1; loopCount <= 5; loopCount++) {
         const output = responsesJsonOutput(current);
         const extracted = extractTextTriggers(output.text);
         const allCalls = [...output.calls, ...extracted.calls].filter((call) => call.name.length > 0);
-        const proxyCalls = allCalls.filter((call) => PROXY_TOOL_NAMES.has(call.name));
-        const realCalls = allCalls.filter((call) => !PROXY_TOOL_NAMES.has(call.name));
+        const proxyCalls = allCalls.filter((call) => RESPONSES_PROXY_TOOL_NAMES.has(call.name));
+        const realCalls = allCalls.filter((call) => !RESPONSES_PROXY_TOOL_NAMES.has(call.name));
         const mutatingProxy = proxyCalls.filter((call) => MUTATING_PROXY_TOOLS.has(call.name));
         if (mutatingProxy.length === 0 || realCalls.length > 0) {
             if (proxyCalls.length > 0) {
@@ -413,6 +504,17 @@ export async function compressLoopResponsesJson(
         if (extracted.clean.trim()) {
             inputItems.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: extracted.clean }] });
         }
+        if (!textProtocol) {
+            for (const call of proxyCalls) {
+                inputItems.push({
+                    type: "function_call",
+                    id: call.itemId,
+                    call_id: call.callId,
+                    name: call.name,
+                    arguments: call.arguments,
+                });
+            }
+        }
         for (const call of proxyCalls) {
             let args: Record<string, unknown> = {};
             try {
@@ -422,9 +524,14 @@ export async function compressLoopResponsesJson(
             }
             const result = executeProxyTool(call.name, args, ctx);
             ctx.log(`[acp-proxy: responses JSON ${call.name} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
-            inputItems.push({ type: "message", role: "user", content: buildVisibilityMarker(call.name, result) });
+            inputItems.push(textProtocol
+                ? { type: "message", role: "user", content: buildVisibilityMarker(call.name, result) }
+                : { type: "function_call_output", call_id: call.callId, output: result });
         }
         requestBody.input = inputItems;
+        if (proxyCalls.some((call) => call.name === "workflow_checkpoint")) {
+            await refreshWorkflowRequest(requestBody, ctx, textProtocol);
+        }
         const { response, clearTimer } = await fetchWithTimeout(requestOptions.url, {
             method: "POST",
             headers: requestOptions.headers,
@@ -551,6 +658,31 @@ export async function* compressLoopResponsesStream(
                                 if (typeof out === "number") ctx.session.stats.outputTokens += out;
                                 ctx.session.stats.cacheSamples += 1;
                             }
+                            // Request ledger: normalize + price this round's usage.
+                            // original/forwarded are best-effort token estimates of
+                            // the full conversation vs. what was actually sent.
+                            if (ctx.usage) {
+                                let acp: { originalContextTokens: number; forwardedContextTokens: number; acpSavedTokens: number } | undefined;
+                                try {
+                                    const originalContextTokens = estimateTokensFast(JSON.stringify(ctx.messages));
+                                    const forwardedContextTokens = estimateTokensFast(JSON.stringify(requestBody.input ?? []));
+                                    acp = {
+                                        originalContextTokens,
+                                        forwardedContextTokens,
+                                        acpSavedTokens: Math.max(0, originalContextTokens - forwardedContextTokens),
+                                    };
+                                } catch {
+                                    // estimation is best-effort — ledger still records tokens.
+                                }
+                                void captureUsage({
+                                    protocol: "codex",
+                                    usage,
+                                    sessionId: ctx.session.id,
+                                    ctx: ctx.usage,
+                                    acp,
+                                    streaming: true,
+                                });
+                            }
                         }
                     }
                 }
@@ -581,8 +713,8 @@ export async function* compressLoopResponsesStream(
             }
         }
         const allCalls = [...fcByItemId.values()].filter((c) => c.name.length > 0);
-        const proxyCalls = allCalls.filter((c) => PROXY_TOOL_NAMES.has(c.name));
-        const realCalls = allCalls.filter((c) => !PROXY_TOOL_NAMES.has(c.name));
+        const proxyCalls = allCalls.filter((c) => RESPONSES_PROXY_TOOL_NAMES.has(c.name));
+        const realCalls = allCalls.filter((c) => !RESPONSES_PROXY_TOOL_NAMES.has(c.name));
         const readonlyProxy = proxyCalls.filter((c) => READONLY_PROXY_TOOLS.has(c.name));
         // DIAG: log what tools the upstream returned this round.
         loggerLog("debug", `[acp-diag] round ${loopCount} allCalls=[${allCalls.map((c) => c.name).join(",")}] realCalls=[${realCalls.map((c) => c.name).join(",")}] customToolCalls=${customToolCalls} text=${JSON.stringify(contentText.slice(0, 120))}`);
@@ -685,6 +817,9 @@ export async function* compressLoopResponsesStream(
         }
 
         requestBody.input = inputItems;
+        if (proxyCalls.some((call) => call.name === "workflow_checkpoint")) {
+            await refreshWorkflowRequest(requestBody, ctx, textProtocol);
+        }
         if (!("stream" in requestBody)) requestBody.stream = true;
 
         const { response: resp, clearTimer } = await fetchWithTimeout(requestOptions.url, {

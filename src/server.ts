@@ -35,18 +35,34 @@ import {
     conversationSignalResponses,
 } from "./responses.js";
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary } from "./session.js";
-import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
+import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_WORKFLOW_TOOLS_ANTHROPIC, ACP_WORKFLOW_TOOLS_OPENAI, ACP_CONTEXT_TOOLS_RESPONSES, WORKFLOW_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
-import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
+import {
+    renderUI,
+    handleConfigGet,
+    handleConfigPut,
+    handleUsageSummary,
+    handleUsageTrends,
+    handleUsageModels,
+    handleUsageProviders,
+    handleUsageRequests,
+    handleUsageRequestById,
+    handleUsagePricingGet,
+    handleUsagePricingPut,
+    handleUsagePricingSync,
+    handleUsageSync,
+    handleUsageSyncStatus,
+} from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
-import { compressLoopStream } from "./compress-loop.js";
-import { compressLoopAnthropicStream } from "./compress-loop-anthropic.js";
+import { compressLoopJson, compressLoopStream } from "./compress-loop.js";
+import { compressLoopAnthropicJson, compressLoopAnthropicStream } from "./compress-loop-anthropic.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
 import { defaultLogFile, stateDir } from "./paths.js";
 import { compressLoopResponsesJson, compressLoopResponsesStream } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
+import { captureUsage } from "./usage/capture.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
@@ -55,6 +71,12 @@ import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "./bili-message.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
+import { preprocessResponsesWorkflow } from "./workflow/responses-preprocessor.js";
+import { attachOperationMessageRefs } from "./workflow/operation-tracker.js";
+import { syncRequirements } from "./workflow/requirements.js";
+import { buildWorkflowSystemPrompt } from "./workflow/prompt.js";
+import { DEFAULT_WORKFLOW_OPTIONS } from "./workflow/types.js";
+import { preprocessCoreWorkflow } from "./workflow/core-preprocessor.js";
 
 const UPSTREAM_HOP_HEADERS = new Set([
     "host",
@@ -298,7 +320,7 @@ async function handle(
         res.end(JSON.stringify({ error: "management request origin does not match the local bili UI" }));
         return;
     }
-    if (req.method === "GET" && req.url === "/__bili/stats") return sendStats(res);
+    if (req.method === "GET" && req.url === "/__bili/stats") return sendStats(opts, res);
     if (req.method === "GET" && req.url === "/") {
         // Browser visits root → redirect to the web UI. curl / health probes
         // (Accept: */* or no Accept) still get the JSON health check so
@@ -339,6 +361,31 @@ async function handle(
         }, opts.port);
     }
     if (req.method === "POST" && req.url === "/__bili/config/reload") return handleConfigReload(opts, res, log);
+    const usageUrl = req.url ?? "";
+    if (req.method === "GET" && usageUrl.startsWith("/__bili/usage/")) {
+        const pathname = usageUrl.split("?")[0]!;
+        if (pathname === "/__bili/usage/summary") return void handleUsageSummary(req, res);
+        if (pathname === "/__bili/usage/trends") return void handleUsageTrends(req, res);
+        if (pathname === "/__bili/usage/models") return void handleUsageModels(req, res);
+        if (pathname === "/__bili/usage/providers") return void handleUsageProviders(req, res);
+        if (pathname === "/__bili/usage/requests") return void handleUsageRequests(req, res);
+        if (pathname === "/__bili/usage/pricing") return void handleUsagePricingGet(req, res);
+        const requestById = /^\/__bili\/usage\/requests\/([^/]+)$/.exec(pathname);
+        if (requestById) return void handleUsageRequestById(req, res, requestById[1]!);
+    }
+    if (req.method === "PUT" && usageUrl.startsWith("/__bili/usage/pricing/")) {
+        const model = decodeURIComponent(usageUrl.split("?")[0]!.slice("/__bili/usage/pricing/".length));
+        if (model) return void handleUsagePricingPut(req, res, model);
+    }
+    if (req.method === "POST" && req.url === "/__bili/usage/pricing/sync") {
+        return void handleUsagePricingSync(req, res);
+    }
+    if (req.method === "POST" && usageUrl.split("?")[0] === "/__bili/usage/sync") {
+        return void handleUsageSync(req, res);
+    }
+    if (req.method === "GET" && usageUrl.split("?")[0] === "/__bili/usage/sync/status") {
+        return void handleUsageSyncStatus(req, res);
+    }
     if (req.method === "GET" && req.url === "/__bili/upstream") {
         const target = opts.upstream;
         const decision = resolveProxyDecision(opts.routes, opts.proxy, target, opts.proxyFallback);
@@ -433,6 +480,7 @@ async function handle(
     // the global env default if neither matches.
     // Parse body once and reuse everywhere (fixes duplicate JSON.parse).
     let parsed: unknown = null;
+    let reqModel: string | undefined;
     if (protocol && bodyBuffer.length > 0) {
         try {
             parsed = JSON.parse(bodyBuffer.toString("utf8"));
@@ -445,6 +493,7 @@ async function handle(
     let reqConfig = config;
     if (parsed && typeof parsed === "object") {
         const model = (parsed as { model?: string }).model;
+        reqModel = model;
         if (model) {
             // Match config by the embedded upstream URL (the /bili/<this> string).
             // The registry is a middle layer when config doesn't cover this URL/model.
@@ -502,7 +551,7 @@ async function handle(
         // (stream rewriter mutates state via compress/decompress) must not
         // interleave across concurrent requests on the same session.
         await withSessionLock(session, async () => {
-            prepared =
+            prepared = await (
                 countTokens
                     ? prepareCountTokens(parsed as AnthropicRequestBody, core, reqConfig, log, session)
                     : protocol === "anthropic"
@@ -511,10 +560,11 @@ async function handle(
                         ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, log, session)
                         : responsesCompact
                           ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session)
-                          : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, log, session, responsesIdentity!);
+                          : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, log, session, responsesIdentity!)
+            );
             acquireInFlight(session);
             try {
-                await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, affinity);
+                await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, affinity, reqModel);
             } finally {
                 releaseInFlight(session);
             }
@@ -524,7 +574,7 @@ async function handle(
         if (protocol === null && !opts.passthrough) {
             log("warn", `unrecognized path ${url} — not a known protocol (/chat/completions, /v1/messages, /responses, /responses/compact); forwarding unchanged`);
         }
-        await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, undefined);
+        await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, undefined, reqModel);
     }
 }
 
@@ -556,7 +606,7 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
     return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}, reason="${n.reason.slice(0, 120)}"`;
 }
 
-function prepareAnthropic(
+async function prepareAnthropic(
     parsed: AnthropicRequestBody,
     req: http.IncomingMessage,
     opts: ProxyOptions,
@@ -564,9 +614,11 @@ function prepareAnthropic(
     config: Config,
     log: (level: string, msg: string) => void,
     session: Session,
-): Prepared {
+): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
+    const workflowOptions = opts.workflow ?? DEFAULT_WORKFLOW_OPTIONS;
+    const proxyInjected = opts.compress.injectTool || workflowOptions.enabled;
     ++session.stats.requests;
 
     let processedMessages: CoreMessage[] = [];
@@ -576,7 +628,9 @@ function prepareAnthropic(
     let toolsOut = parsed.tools;
 
     try {
-        const { msgs, cacheControls } = anthropicToCore(parsed);
+        const converted = anthropicToCore(parsed);
+        const cacheControls = converted.cacheControls;
+        const msgs = await preprocessCoreWorkflow(converted.msgs, session, workflowOptions);
         originalMessages = msgs;
         // tokenCount drives the nudge decision ("should we compress?"). It MUST
         // be the real context size, never an estimate — estimates undercount
@@ -602,12 +656,12 @@ function prepareAnthropic(
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
 
         systemOut = injectSystem(parsed, opts);
-        if (opts.compress.injectTool) {
-            toolsOut = injectTool(parsed.tools);
+        if (proxyInjected) {
+            toolsOut = injectTool(parsed.tools, opts.compress.injectTool, workflowOptions.enabled);
         }
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.
-        if (turn.nudge?.shouldInject) {
+        if (turn.nudge?.shouldInject && opts.compress.injectTool) {
             try {
                 const rendered = renderNudgeText(turn.nudge);
                 if (rendered.text) {
@@ -623,10 +677,10 @@ function prepareAnthropic(
 
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: opts.compress.injectTool } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: proxyInjected } as Prepared;
 }
 
-function prepareOpenai(
+async function prepareOpenai(
     parsed: OpenAIRequestBody,
     req: http.IncomingMessage,
     opts: ProxyOptions,
@@ -634,7 +688,7 @@ function prepareOpenai(
     config: Config,
     log: (level: string, msg: string) => void,
     session: Session,
-): Prepared {
+): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
@@ -653,9 +707,12 @@ function prepareOpenai(
     // provider prefix cache for every subsequent turn.
     const isTitleGen = maxTokens <= 200;
     const shouldInject = opts.compress.injectTool && !isTitleGen;
+    const workflowOptions = opts.workflow ?? DEFAULT_WORKFLOW_OPTIONS;
+    const proxyInjected = shouldInject || (workflowOptions.enabled && !isTitleGen);
 
     try {
-        const { msgs } = openaiToCore(parsed);
+        const converted = openaiToCore(parsed);
+        const msgs = await preprocessCoreWorkflow(converted.msgs, session, workflowOptions);
         originalMessages = msgs;
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment). Never an estimate.
@@ -681,9 +738,10 @@ function prepareOpenai(
         // would invalidate the cache every turn.
         const sysParts: string[] = [];
         if (shouldInject) sysParts.push(buildCompressSystemPrompt());
+        if (workflowOptions.enabled && !isTitleGen) sysParts.push(buildWorkflowSystemPrompt(false));
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
-        if (shouldInject) {
-            toolsOut = injectOpenaiTool(parsed.tools);
+        if (proxyInjected) {
+            toolsOut = injectOpenaiTool(parsed.tools, shouldInject, workflowOptions.enabled);
         }
         // Nudge as a separate trailing user message (cache-friendly).
         if (turn.nudge?.shouldInject && shouldInject) {
@@ -711,10 +769,10 @@ function prepareOpenai(
         (rebuilt as Record<string, unknown>).stream_options = { include_usage: true };
     }
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: shouldInject } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: proxyInjected } as Prepared;
 }
 
-function prepareResponses(
+async function prepareResponses(
     parsed: ResponsesRequestBody,
     req: http.IncomingMessage,
     opts: ProxyOptions,
@@ -723,7 +781,7 @@ function prepareResponses(
     log: (level: string, msg: string) => void,
     session: Session,
     identity: ConversationIdentity,
-): Prepared {
+): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
@@ -741,11 +799,25 @@ function prepareResponses(
     const responsesTextProtocol = FORCE_TEXT_PROTOCOL ||
         isChatGptCodexUpstream(session.meta.upstreamOrigin) ||
         isCodexResponsesLite(req.headers, parsed);
+    const workflowOptions = opts.workflow ?? DEFAULT_WORKFLOW_OPTIONS;
+    let workflowParsed = parsed;
 
     try {
-        const projection = responsesToCore(parsed);
+        const workflowResult = await preprocessResponsesWorkflow(
+            parsed,
+            session,
+            workflowOptions,
+            config.modelContextLimit,
+            responsesTextProtocol,
+        );
+        workflowParsed = workflowResult.body;
+        rebuiltInput = workflowParsed.input;
+        toolsOut = workflowParsed.tools;
+        const projection = responsesToCore(workflowParsed);
         responsesProjection = projection;
         const { msgs } = projection;
+        attachOperationMessageRefs(session.workflow, msgs);
+        syncRequirements(session.workflow, msgs, session.id);
         originalMessages = msgs;
         if (process.env.ACP_DEBUG) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
@@ -763,11 +835,17 @@ function prepareResponses(
         processedMessages = turn.messages;
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
+        const prompts: string[] = [];
         if (shouldInject && !process.env.ACP_NO_COMPRESS_PROMPT) {
-            const prompt = responsesTextProtocol ? buildCompressTextSystemPrompt() : buildCompressSystemPrompt();
-            const devContent = [...projection.systemParts, prompt].join("\n\n---\n\n");
+            prompts.push(responsesTextProtocol ? buildCompressTextSystemPrompt() : buildCompressSystemPrompt());
+        }
+        if (workflowOptions.enabled) prompts.push(buildWorkflowSystemPrompt(responsesTextProtocol));
+        if (prompts.length > 0) {
+            const devContent = [...projection.systemParts, ...prompts].join("\n\n---\n\n");
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
-            if (!responsesTextProtocol && !process.env.ACP_NO_INJECT_TOOL) toolsOut = injectResponsesTool(parsed.tools);
+            if (!responsesTextProtocol && !process.env.ACP_NO_INJECT_TOOL) {
+                toolsOut = injectResponsesTool(workflowParsed.tools, shouldInject, workflowOptions.enabled);
+            }
         } else if (projection.systemParts.length > 0) {
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, projection.systemParts.join("\n\n---\n\n"));
         }
@@ -789,7 +867,7 @@ function prepareResponses(
         processedMessages = [];
     }
 
-    const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
+    const rebuilt: ResponsesRequestBody = { ...workflowParsed, input: rebuiltInput, tools: toolsOut };
     const promptCacheKey = resolvePromptCacheKey(
         rebuilt.prompt_cache_key,
         identity,
@@ -827,7 +905,7 @@ function prepareResponses(
         responsesProjection,
         protocol: "responses",
         stream,
-        compressInjected: shouldInject,
+        compressInjected: shouldInject || workflowOptions.enabled,
         responsesTextProtocol,
     };
 }
@@ -941,26 +1019,29 @@ function injectSystem(
     const baseText = extractSystem(parsed.system);
     const parts: string[] = [];
     if (opts.compress.injectTool) parts.push(buildCompressSystemPrompt());
+    if ((opts.workflow ?? DEFAULT_WORKFLOW_OPTIONS).enabled) parts.push(buildWorkflowSystemPrompt(false));
     if (parts.length === 0) return parsed.system;
     const full = baseText ? `${baseText}\n\n---\n\n${parts.join("\n\n")}` : parts.join("\n\n");
     return buildSystem(full, parsed.system);
 }
 
-function injectTool(tools: unknown[] | undefined): unknown[] {
-    if (!Array.isArray(tools)) return [...ACP_TOOLS_ANTHROPIC];
+function injectTool(tools: unknown[] | undefined, includeCompression: boolean, includeWorkflow: boolean): unknown[] {
+    const desired = includeCompression ? ACP_TOOLS_ANTHROPIC : includeWorkflow ? ACP_WORKFLOW_TOOLS_ANTHROPIC : [];
+    if (!Array.isArray(tools)) return [...desired];
     const names = new Set(tools.map((t) => (t as { name?: string })?.name));
-    const missing = ACP_TOOLS_ANTHROPIC.filter((t) => !names.has(t.name));
+    const missing = desired.filter((t) => !names.has(t.name));
     return missing.length === 0 ? tools : [...tools, ...missing];
 }
 
-function injectOpenaiTool(tools: OpenAITool[] | undefined): OpenAITool[] {
-    if (!Array.isArray(tools)) return [...ACP_TOOLS_OPENAI] as OpenAITool[];
+function injectOpenaiTool(tools: OpenAITool[] | undefined, includeCompression: boolean, includeWorkflow: boolean): OpenAITool[] {
+    const desired = includeCompression ? ACP_TOOLS_OPENAI : includeWorkflow ? ACP_WORKFLOW_TOOLS_OPENAI : [];
+    if (!Array.isArray(tools)) return [...desired] as OpenAITool[];
     const present = new Set(
         tools
             .map((t) => t?.function?.name)
             .filter((n): n is string => typeof n === "string"),
     );
-    const additions = ACP_TOOLS_OPENAI.filter((t) => !present.has(t.function.name));
+    const additions = desired.filter((t) => !present.has(t.function.name));
     return [...tools, ...(additions as OpenAITool[])];
 }
 
@@ -970,17 +1051,23 @@ function injectOpenaiTool(tools: OpenAITool[] | undefined): OpenAITool[] {
  *  In text mode we keep `tools` untouched (undefined) so code_mode stays
  *  active, and detect the trigger in the output_text stream instead. */
 const FORCE_TEXT_PROTOCOL = process.env.ACP_COMPRESS_PROTOCOL === "text";
-/** Inject all ACP tools (compress/decompress/search_context/acp_status) in
- *  Responses API flat format, matching the PROXY_TOOL_NAMES set the compress
- *  loop dispatches on. Idempotent. */
-function injectResponsesTool(tools: unknown[] | undefined): unknown[] {
-    if (!Array.isArray(tools)) return [...ACP_TOOLS_RESPONSES];
+/** Inject selected compression and workflow tools in Responses API flat format. */
+function injectResponsesTool(
+    tools: unknown[] | undefined,
+    includeCompression = true,
+    includeWorkflow = true,
+): unknown[] {
+    const desired = [
+        ...(includeCompression ? ACP_CONTEXT_TOOLS_RESPONSES : []),
+        ...(includeWorkflow ? WORKFLOW_TOOLS_RESPONSES : []),
+    ];
+    if (!Array.isArray(tools)) return [...desired];
     const present = new Set(
         tools
             .map((t) => (t as { name?: string })?.name)
             .filter((n): n is string => typeof n === "string"),
     );
-    const additions = ACP_TOOLS_RESPONSES.filter((t) => !present.has(t.name));
+    const additions = desired.filter((t) => !present.has(t.name));
     return [...tools, ...additions];
 }
 
@@ -995,12 +1082,18 @@ async function forward(
     log: (level: string, msg: string) => void,
     route: ReturnType<typeof resolveUpstream>,
     affinity?: string,
+    model?: string,
 ): Promise<void> {
     // rewrittenUrl may use a `mitm://` scheme (for config-lookup distinction
     // — see resolveUpstream). fetch needs the real https:// scheme, so strip
     // mitm:// back to https:// for the actual upstream request.
     const rewritten = route ? route.rewrittenUrl : opts.upstream + (req.url ?? "");
     const upstreamUrl = rewritten.replace(/^mitm:\/\//, "https://");
+    // Usage-ledger capture context: model from the request body, provider from
+    // the resolved upstream host.
+    const usageCapture = model
+        ? { model, provider: (() => { try { return new URL(upstreamUrl).host; } catch { return undefined; } })() }
+        : undefined;
     // Show the final proxied URL (where the request actually lands) as the
     // primary signal. The provider label is appended only for named routes —
     // zero-config requests have a single routing mode now, so the final
@@ -1197,7 +1290,7 @@ async function forward(
             reqHeaders["content-type"] = "application/json";
             const loop = compressLoopStream(
                 streamToRead,
-                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl },
+                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, usage: usageCapture },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders },
             );
@@ -1220,7 +1313,7 @@ async function forward(
             reqHeaders["content-type"] = "application/json";
             const loop = compressLoopResponsesStream(
                 streamToRead,
-                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: prepared.responsesTextProtocol },
+                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: prepared.responsesTextProtocol, usage: usageCapture, workflowOptions: opts.workflow },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders },
             );
@@ -1243,7 +1336,7 @@ async function forward(
             reqHeaders["content-type"] = "application/json";
             const loop = compressLoopAnthropicStream(
                 streamToRead,
-                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl },
+                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, usage: usageCapture },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders },
             );
@@ -1275,7 +1368,7 @@ async function forward(
             const text = Buffer.from(buf).toString("utf8");
             try {
                 let json = JSON.parse(text) as Record<string, unknown>;
-                if (prepared.protocol === "responses" && prepared.responsesTextProtocol) {
+                if (prepared.protocol === "openai" || prepared.protocol === "anthropic" || prepared.protocol === "responses") {
                     const requestBody = JSON.parse(typeof body === "string" ? body : body.toString("utf8")) as Record<string, unknown>;
                     const requestHeaders: Record<string, string> = {};
                     for (const [key, value] of Object.entries(headers)) {
@@ -1283,12 +1376,28 @@ async function forward(
                         requestHeaders[key] = value;
                     }
                     requestHeaders["content-type"] = "application/json";
-                    json = await compressLoopResponsesJson(
-                        json,
-                        { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: true },
-                        requestBody,
-                        { url: upstreamUrl, headers: requestHeaders },
-                    );
+                    if (prepared.protocol === "openai") {
+                        json = await compressLoopJson(
+                            json,
+                            { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, usage: usageCapture },
+                            requestBody,
+                            { url: upstreamUrl, headers: requestHeaders },
+                        );
+                    } else if (prepared.protocol === "anthropic") {
+                        json = await compressLoopAnthropicJson(
+                            json,
+                            { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, usage: usageCapture },
+                            requestBody,
+                            { url: upstreamUrl, headers: requestHeaders },
+                        );
+                    } else {
+                        json = await compressLoopResponsesJson(
+                            json,
+                            { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: prepared.responsesTextProtocol, usage: usageCapture, workflowOptions: opts.workflow },
+                            requestBody,
+                            { url: upstreamUrl, headers: requestHeaders },
+                        );
+                    }
                 }
                 // Capture upstream usage so tokenCount (which drives nudge +
                 // emergency-truncate) reflects reality for non-streaming
@@ -1314,6 +1423,17 @@ async function forward(
                     }
                     const out = u.completion_tokens ?? u.output_tokens;
                     if (typeof out === "number") prepared.session.stats.outputTokens += out;
+                    // Request ledger (non-streaming): normalize + price the
+                    // response usage. `responses` maps to the codex protocol.
+                    if (usageCapture && typeof prompt === "number") {
+                        void captureUsage({
+                            protocol: prepared.protocol === "responses" ? "codex" : prepared.protocol,
+                            usage: u,
+                            sessionId: prepared.session.id,
+                            ctx: usageCapture,
+                            streaming: false,
+                        });
+                    }
                 }
                 if (prepared.protocol === "openai") {
                     rewriteOpenaiJsonResponse(json, ctx);
@@ -1398,13 +1518,15 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     // removed/changed don't leak for the process lifetime. The next request
     // re-creates the needed agent lazily via proxyDispatcher().
     resetProxyCache();
+    const freshFull = loadOptions();
+    opts.workflow = freshFull.workflow;
     const names = Object.keys(fresh);
     log("info", `[acp-web] routes hot-reloaded (${names.length} providers): ${names.join(", ") || "(none)"}`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, count: names.length, routes: names }));
 }
 
-function sendStats(res: http.ServerResponse): void {
+function sendStats(opts: ProxyOptions, res: http.ServerResponse): void {
     const sessions = listSessions().map((s) => ({
         id: s.id,
         protocol: s.meta.protocol,
@@ -1418,6 +1540,16 @@ function sendStats(res: http.ServerResponse): void {
         outputTokens: s.stats.outputTokens,
         cacheSamples: s.stats.cacheSamples,
         cacheHitPct: s.stats.cacheSamples > 0 && s.stats.inputTokens > 0 ? Math.round(s.stats.cachedTokens / s.stats.inputTokens * 100) : null,
+        workflow: {
+            enabled: opts.workflow?.enabled ?? DEFAULT_WORKFLOW_OPTIONS.enabled,
+            projectId: s.workflow.projectId,
+            currentPhase: s.workflow.activePhaseId,
+            phaseCount: Object.keys(s.workflow.phases).length,
+            contextTargetRatio: opts.workflow?.targetContextRatio ?? DEFAULT_WORKFLOW_OPTIONS.targetContextRatio,
+            metrics: s.workflow.metrics,
+            archiveRecords: Object.keys(s.workflow.rawArchive).length,
+            archiveTokens: Object.values(s.workflow.rawArchive).reduce((total, record) => total + record.tokenCount, 0),
+        },
         lastSeen: new Date(s.lastSeen).toISOString(),
     }));
     res.writeHead(200, { "content-type": "application/json" });

@@ -10,6 +10,23 @@ export {
     readUpstreamSettings,
 } from "./api.js";
 
+export {
+    handleUsageSummary,
+    handleUsageTrends,
+    handleUsageModels,
+    handleUsageProviders,
+    handleUsageRequests,
+    handleUsageRequestById,
+    handleUsagePricingGet,
+    handleUsagePricingPut,
+    handleUsagePricingSync,
+} from "./usage-api.js";
+
+export {
+    handleUsageSync,
+    handleUsageSyncStatus,
+} from "../usage/importers/index.js";
+
 function version(): string {
     try {
         const here = fileURLToPath(import.meta.url);

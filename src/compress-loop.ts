@@ -7,7 +7,7 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
-import type { Session } from "./session.js";
+import { markDirty, type Session } from "./session.js";
 import {
     MUTATING_PROXY_TOOLS,
     parseCompressInput,
@@ -20,6 +20,8 @@ import { fetchWithTimeout } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { log as loggerLog } from "./logger.js";
+import { captureUsage, type UsageCaptureCtx } from "./usage/capture.js";
+import { expandOperation, retrieveRawOutput } from "./workflow/archive.js";
 
 interface CompressLoopCtx {
     core: CompressionCore;
@@ -30,6 +32,8 @@ interface CompressLoopCtx {
     /** Resolved upstream proxy URL (http://host:port) or undefined for direct.
      *  Pre-resolved by the caller (server.ts) via resolveProxy(). */
     proxyUrl?: string;
+    /** Usage-ledger capture context (model/provider). Omitted = no ledger. */
+    usage?: UsageCaptureCtx;
 }
 
 interface RequestOptions {
@@ -70,6 +74,17 @@ function executeProxyTool(
     }
     if (toolName === "acp_status") {
         return buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast);
+    }
+    if (toolName === "retrieve_raw") {
+        const rawRef = typeof args.rawRef === "string" ? args.rawRef : "";
+        if (!rawRef) return "[retrieve_raw FAILED: rawRef is required]";
+        const result = retrieveRawOutput(ctx.session.id, ctx.session.workflow, rawRef);
+        markDirty(ctx.session);
+        return result;
+    }
+    if (toolName === "expand_operation") {
+        const opId = typeof args.opId === "string" ? args.opId : "";
+        return opId ? expandOperation(ctx.session.workflow, opId) : "[expand_operation FAILED: opId is required]";
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }
@@ -203,6 +218,89 @@ export function buildVisibilityMarker(toolName: string, result: string): string 
 
     const inner = (lines[0] ?? "").replace(/^\[/, "").replace(/\]$/, "").trim();
     return `\n${icon} [ACP] ${inner}\n`;
+}
+
+function openaiJsonToolCalls(response: Record<string, unknown>): { content: unknown; calls: ToolCallAccumulator[] } {
+    const choices = response.choices as Array<Record<string, unknown>> | undefined;
+    const message = choices?.[0]?.message as Record<string, unknown> | undefined;
+    const rawCalls = message?.tool_calls as Array<Record<string, unknown>> | undefined;
+    const calls = (rawCalls ?? []).flatMap((raw, index) => {
+        const fn = raw.function as Record<string, unknown> | undefined;
+        const name = typeof fn?.name === "string" ? fn.name : "";
+        if (!name) return [];
+        return [{
+            index,
+            id: typeof raw.id === "string" ? raw.id : `call_${index}`,
+            name,
+            arguments: typeof fn?.arguments === "string" ? fn.arguments : "{}",
+        }];
+    });
+    return { content: message?.content ?? null, calls };
+}
+
+function openaiJsonLoopError(current: Record<string, unknown>, detail: string): Record<string, unknown> {
+    const choices = current.choices as Array<Record<string, unknown>> | undefined;
+    if (!choices?.[0]) return current;
+    choices[0].message = { role: "assistant", content: `[acp-proxy: ${detail}]` };
+    choices[0].finish_reason = "stop";
+    return current;
+}
+
+export async function compressLoopJson(
+    initialResponse: Record<string, unknown>,
+    ctx: CompressLoopCtx,
+    requestBody: Record<string, unknown>,
+    requestOptions: RequestOptions,
+): Promise<Record<string, unknown>> {
+    let current = initialResponse;
+    for (let loopCount = 1; loopCount <= 5; loopCount++) {
+        const output = openaiJsonToolCalls(current);
+        const proxyCalls = output.calls.filter((call) => PROXY_TOOL_NAMES.has(call.name));
+        const realCalls = output.calls.filter((call) => !PROXY_TOOL_NAMES.has(call.name));
+        if (proxyCalls.length === 0 || realCalls.length > 0) return current;
+        const messages = Array.isArray(requestBody.messages) ? [...requestBody.messages as unknown[]] : [];
+        messages.push({
+            role: "assistant",
+            content: output.content,
+            tool_calls: proxyCalls.map((call) => ({
+                id: call.id,
+                type: "function",
+                function: { name: call.name, arguments: call.arguments },
+            })),
+        });
+        for (const call of proxyCalls) {
+            let args: Record<string, unknown> = {};
+            try {
+                const parsed = JSON.parse(call.arguments) as unknown;
+                if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) args = parsed as Record<string, unknown>;
+            } catch {
+            }
+            const result = executeProxyTool(call.name, args, ctx);
+            ctx.log(`[acp-proxy: OpenAI JSON ${call.name} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
+            messages.push({ role: "tool", tool_call_id: call.id, content: result });
+        }
+        requestBody.messages = messages;
+        try {
+            const { response, clearTimer } = await fetchWithTimeout(requestOptions.url, {
+                method: "POST",
+                headers: requestOptions.headers,
+                body: JSON.stringify(requestBody),
+                ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
+            });
+            try {
+                if (!response.ok) {
+                    const detail = await response.text().catch(() => "upstream error");
+                    return openaiJsonLoopError(current, `upstream error ${response.status}: ${detail.slice(0, 200)}`);
+                }
+                current = await response.json() as Record<string, unknown>;
+            } finally {
+                clearTimer();
+            }
+        } catch (error) {
+            return openaiJsonLoopError(current, String(error));
+        }
+    }
+    return openaiJsonLoopError(current, "JSON proxy loop limit reached");
 }
 
 export async function* compressLoopStream(
@@ -361,6 +459,16 @@ export async function* compressLoopStream(
                 if (typeof cached === "number") ctx.session.stats.cachedTokens += cached;
                 if (typeof out === "number") ctx.session.stats.outputTokens += out;
                 ctx.session.stats.cacheSamples += 1;
+                // Request ledger: normalize + price this round's usage.
+                if (ctx.usage) {
+                    void captureUsage({
+                        protocol: "openai",
+                        usage,
+                        sessionId: ctx.session.id,
+                        ctx: ctx.usage,
+                        streaming: true,
+                    });
+                }
             }
         }
 

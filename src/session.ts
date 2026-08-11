@@ -1,5 +1,7 @@
 import { createInitialState, type CompressionState } from "acp-kernel";
 import { getStore } from "./persist.js";
+import { createInitialWorkflowState } from "./workflow/state.js";
+import type { WorkflowState } from "./workflow/types.js";
 
 export type BlockContent = {
     one: { text: string; count: number };
@@ -55,6 +57,7 @@ export type Session = {
      *  members. Persisted as-is (must be JSON-serializable). Use sparingly —
      *  prefer promoting a stable field into `meta` or `stats` once it's clear. */
     metadata: Record<string, unknown>;
+    workflow: WorkflowState;
     state: CompressionState;
     createdAt: number;
     lastSeen: number;
@@ -138,6 +141,7 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
         meta: { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin, label: meta?.label },
         stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
         metadata: {},
+        workflow: createInitialWorkflowState(),
         state: createInitialState(),
         createdAt: Date.now(),
         lastSeen: Date.now(),

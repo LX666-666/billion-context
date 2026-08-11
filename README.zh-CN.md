@@ -19,9 +19,9 @@ AI 编程助手的通用上下文压缩代理。
         │  你把助手的 base URL 指向 proxy
         ▼
 ┌─────────────────┐
-│  billion-context│   1. 解析请求(Anthropic 或 OpenAI 格式)
-│     proxy       │   2. 对对话运行 acp-kernel 压缩
-│                 │   3. 注入 `compress` 工具 + 压缩哲学
+│  billion-context│   1. 解析 Anthropic / Chat / Responses 请求
+│     proxy       │   2. Tool Output 首次入模前裁剪
+│                 │   3. Workflow GC + acp-kernel 压缩
 │                 │   4. 转发到真实模型 API
 │                 │   5. 重写流式响应
 └─────────────────┘
@@ -30,7 +30,18 @@ AI 编程助手的通用上下文压缩代理。
    真实模型 API (Anthropic / OpenAI / 兼容厂商)
 ```
 
-代理向对话注入四个上下文管理工具(`compress`、`decompress`、`search_context`、`acp_status`)。模型在对话增长时调用 `compress`,代理在服务端执行 —— 压缩后的范围在下一轮之前折叠进对话历史。
+代理向对话注入六个上下文工具(`compress`、`decompress`、`search_context`、`acp_status`、`retrieve_raw`、`expand_operation`)。Responses 客户端还会获得 `workflow_checkpoint`;Codex code mode 使用等价的、由代理截获的文本协议,不会破坏原生工具。
+
+### 工作流感知的上下文管理
+
+- BUILD、TEST、INSTALL、SEARCH、LIST 输出会在昂贵主模型第一次读取前清噪并结构化;有语义的原始输出用 `raw_ref` 归档且可恢复。
+- READ、PATCH、WRITE、DIFF 默认禁止语义裁剪,不会让便宜模型总结当前源码。
+- 可选的 OpenAI-compatible 便宜模型只处理确定性阶段后仍然很大的低价值输出。它只接收当前输出、Phase 目标和有界 Requirement Hint,不会收到完整 Session;若精确诊断行丢失则原样回退。
+- Codex `update_plan` 是 Phase 边界。Phase 完成后先由主模型写 checkpoint,再一次性 rollover 旧 READ/PATCH/日志工作集。
+- 下一 Phase 需要代码时重新读取当前 Repository;Repository 永远高于历史 checkpoint。
+- 高保真 Requirement Ledger 和最近 checkpoint 通过 Project Memory 跨会话持久化,新会话不注入旧源码快照。
+
+Codex Responses 是第一优先级工作流适配器;Anthropic 和 OpenAI Chat 复用同一套确定性 pre-ingest pruning 核心。
 
 ## 安装
 
@@ -273,6 +284,23 @@ bili --no-auto-update        # 本次启动禁用自动更新
 | `BILI_PERSIST_DEBOUNCE_MS` | `500` | 写磁盘的防抖窗口(毫秒) |
 | `BILI_MAX_SESSIONS` | `256` | 内存中保留的最大会话数(LRU 淘汰;磁盘是真相源) |
 | `BILI_SESSIONS_DIR` | *(XDG data 目录)* | 持久化会话状态的目录 |
+| `BILI_WORKFLOW_ENABLED` | `1` | 启用工作流感知上下文管理 |
+| `BILI_WORKFLOW_TARGET_RATIO` | `0.20` | rollover 调度器的目标活跃上下文比例 |
+| `BILI_WORKFLOW_PHASE_GC` | `1` | 启用 Phase 边界 GC |
+| `BILI_WORKFLOW_SESSION_GC` | `1` | 启用 Session / Project History 压缩策略 |
+| `BILI_WORKFLOW_REREAD_AFTER_PHASE` | `1` | Phase rollover 后要求重新读取 Repository |
+| `BILI_WORKFLOW_PRUNER` | `1` | 启用确定性首次入模前裁剪 |
+| `BILI_WORKFLOW_PRUNER_MIN_TOKENS` | `2000` | 触发语义结构化的最小清理后 Tool Output 大小 |
+| `BILI_WORKFLOW_CHEAP_MODEL_ENABLED` | `0` | 启用可选的 OpenAI-compatible 便宜输出裁剪器 |
+| `BILI_WORKFLOW_CHEAP_MODEL_ENDPOINT` | *(无)* | 完整 chat-completions 端点;支持本地、免费层、nano 或自定义 API |
+| `BILI_WORKFLOW_CHEAP_MODEL_NAME` | *(无)* | 发送给端点的便宜模型名 |
+| `BILI_WORKFLOW_CHEAP_MODEL_API_KEY` | *(无)* | 便宜模型端点的可选 Bearer Token |
+| `BILI_WORKFLOW_CHEAP_MODEL_MIN_TOKENS` | `8000` | 确定性处理后仍达到此大小才考虑便宜模型 |
+| `BILI_WORKFLOW_CHEAP_MODEL_MAX_OUTPUT_TOKENS` | `2000` | 便宜模型裁剪结果的最大 Token |
+| `BILI_WORKFLOW_CHEAP_MODEL_TIMEOUT_MS` | `30000` | 便宜模型请求超时 |
+| `BILI_WORKFLOW_ROLLOVER_MIN_TOKENS` | `12000` | 触发 Phase rollover 的 pending-drop 大小 |
+| `BILI_WORKFLOW_ARCHIVE_RAW` | `1` | 归档被语义裁剪的原始输出 |
+| `BILI_WORKFLOW_PROJECT_KEY` | *(自动)* | Codex metadata/cwd 不可用时显式指定稳定项目标识 |
 
 ### 配置文件(可选)
 
@@ -287,6 +315,21 @@ bili --no-auto-update        # 本次启动禁用自动更新
 {
   "port": 8787,
   "host": "127.0.0.1",
+  "workflow": {
+    "enabled": true,
+    "context": { "targetRatio": 0.2, "phaseGc": true, "sessionGc": true },
+    "code": { "rereadAfterPhase": true },
+    "pruner": {
+      "enabled": true,
+      "minTokens": 2000,
+      "cheapModel": {
+        "enabled": false,
+        "endpoint": "http://127.0.0.1:11434/v1/chat/completions",
+        "model": "qwen3:4b"
+      }
+    },
+    "archive": { "semanticRaw": true }
+  },
   "providers": {
     "https://open.bigmodel.cn/api/coding/paas/v4": {
       "models": {
@@ -311,6 +354,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 | `passthrough` | `false` | 不压缩直接转发(等同 `ACP_PASSTHROUGH=1`) |
 | `providers` | *(无)* | 按 URL 的 context 覆盖 —— 见下文 |
 | `compress` | *(见默认值)* | `{ injectTool, injectNudge }` |
+| `workflow` | *(启用)* | Phase/checkpoint/GC、确定性裁剪、Raw Archive 与 Project Memory 设置 |
 | `proxy` | *(无)* | 代理自身访问模型提供商时走的上游 HTTP 代理(`http://host:port`)。按 URL 的 `proxy` 会覆盖它。见[上游代理](#上游代理防火墙gfw)。 |
 
 > **选择 `host`**(IPv6 / 容器):默认 `127.0.0.1` 只听 IPv4 且仅
@@ -428,7 +472,7 @@ Windows 下会自动发现常见 Clash/Mihomo 静态系统代理;Web UI 会显�
 
 ## 状态
 
-早期。协议处理和压缩已通过 mock 测试(146 项通过)。真实模型集成测试是下一里程碑。预期会有粗糙的地方。
+持续开发中。Anthropic、OpenAI Chat、Responses 适配器、Codex 官方传输、Workflow Checkpoint、Raw Retrieval、Phase Rollover、Session 持久化和 Project Memory 均有自动化测试覆盖。
 
 pi 扩展模式(进程内、更紧密集成、参考实现)见 [billion-context-pi](https://github.com/ranxianglei/billion-context-pi)。
 

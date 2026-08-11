@@ -5,7 +5,7 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
-import type { Session } from "./session.js";
+import { markDirty, type Session } from "./session.js";
 import {
     MUTATING_PROXY_TOOLS,
     parseCompressInput,
@@ -18,6 +18,8 @@ import { buildVisibilityMarker } from "./compress-loop.js";
 import { fetchWithTimeout } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
+import { captureUsage, type UsageCaptureCtx } from "./usage/capture.js";
+import { expandOperation, retrieveRawOutput } from "./workflow/archive.js";
 
 /** Anthropic SSE multi-round compress loop.
  *
@@ -43,6 +45,8 @@ interface CompressLoopAnthropicCtx {
     log: (msg: string) => void;
     /** Resolved upstream proxy URL (http://host:port) or undefined for direct. */
     proxyUrl?: string;
+    /** Usage-ledger capture context (model/provider). Omitted = no ledger. */
+    usage?: UsageCaptureCtx;
 }
 
 interface RequestOptions {
@@ -83,7 +87,78 @@ function executeProxyTool(
     if (toolName === "acp_status") {
         return buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast);
     }
+    if (toolName === "retrieve_raw") {
+        const rawRef = typeof args.rawRef === "string" ? args.rawRef : "";
+        if (!rawRef) return "[retrieve_raw FAILED: rawRef is required]";
+        const result = retrieveRawOutput(ctx.session.id, ctx.session.workflow, rawRef);
+        markDirty(ctx.session);
+        return result;
+    }
+    if (toolName === "expand_operation") {
+        const opId = typeof args.opId === "string" ? args.opId : "";
+        return opId ? expandOperation(ctx.session.workflow, opId) : "[expand_operation FAILED: opId is required]";
+    }
     return `[Unknown proxy tool: ${toolName}]`;
+}
+
+function anthropicJsonLoopError(current: Record<string, unknown>, detail: string): Record<string, unknown> {
+    current.content = [{ type: "text", text: `[acp-proxy: ${detail}]` }];
+    current.stop_reason = "end_turn";
+    return current;
+}
+
+export async function compressLoopAnthropicJson(
+    initialResponse: Record<string, unknown>,
+    ctx: CompressLoopAnthropicCtx,
+    requestBody: Record<string, unknown>,
+    requestOptions: RequestOptions,
+): Promise<Record<string, unknown>> {
+    let current = initialResponse;
+    for (let loopCount = 1; loopCount <= 5; loopCount++) {
+        const content = Array.isArray(current.content) ? current.content as Array<Record<string, unknown>> : [];
+        const toolBlocks = content.filter((block) => block.type === "tool_use" && typeof block.name === "string");
+        const proxyBlocks = toolBlocks.filter((block) => PROXY_TOOL_NAMES.has(String(block.name)));
+        const realBlocks = toolBlocks.filter((block) => !PROXY_TOOL_NAMES.has(String(block.name)));
+        if (proxyBlocks.length === 0 || realBlocks.length > 0) return current;
+        const messages = Array.isArray(requestBody.messages) ? [...requestBody.messages as unknown[]] : [];
+        messages.push({ role: "assistant", content });
+        const results: Record<string, unknown>[] = [];
+        for (const block of proxyBlocks) {
+            const args = block.input && typeof block.input === "object" && !Array.isArray(block.input)
+                ? block.input as Record<string, unknown>
+                : {};
+            const name = String(block.name);
+            const result = executeProxyTool(name, args, ctx);
+            ctx.log(`[acp-proxy: Anthropic JSON ${name} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
+            results.push({
+                type: "tool_result",
+                tool_use_id: typeof block.id === "string" ? block.id : `toolu_${results.length}`,
+                content: result,
+            });
+        }
+        messages.push({ role: "user", content: results });
+        requestBody.messages = messages;
+        try {
+            const { response, clearTimer } = await fetchWithTimeout(requestOptions.url, {
+                method: "POST",
+                headers: requestOptions.headers,
+                body: JSON.stringify(requestBody),
+                ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
+            });
+            try {
+                if (!response.ok) {
+                    const detail = await response.text().catch(() => "upstream error");
+                    return anthropicJsonLoopError(current, `upstream error ${response.status}: ${detail.slice(0, 200)}`);
+                }
+                current = await response.json() as Record<string, unknown>;
+            } finally {
+                clearTimer();
+            }
+        } catch (error) {
+            return anthropicJsonLoopError(current, String(error));
+        }
+    }
+    return anthropicJsonLoopError(current, "JSON proxy loop limit reached");
 }
 
 function parseAnthropicSse(eventStr: string): { type: string; data: Record<string, unknown> } | null {
@@ -192,6 +267,7 @@ export async function* compressLoopAnthropicStream(
         let totalOutputTokens = 0;
         let totalInputTokens = 0;
         let totalCachedTokens = 0;
+        let totalCacheCreationTokens = 0;
 
         for (let loopCount = 1; ; loopCount++) {
             if (loopCount > 10) {
@@ -214,7 +290,7 @@ export async function* compressLoopAnthropicStream(
                 onOutputTokens: (n) => { totalOutputTokens += n; },
                 onMessageId: (id) => { if (!messageId) messageId = id; },
                 onStopReason: (r) => { roundStopReason = r; },
-                onCacheUsage: (input, cached) => {
+                onCacheUsage: (input, cached, cacheCreation) => {
                     if (typeof input === "number") {
                         ctx.session.stats.inputTokens += input;
                         // tokenCount drives the nudge decision: it must be the
@@ -232,6 +308,7 @@ export async function* compressLoopAnthropicStream(
                         ctx.session.stats.cacheSamples += 1;
                         totalCachedTokens += cached;
                     }
+                    if (typeof cacheCreation === "number") totalCacheCreationTokens += cacheCreation;
                 },
             };
             try {
@@ -289,6 +366,22 @@ export async function* compressLoopAnthropicStream(
                 }
                 const stop = hasRealToolUse ? "tool_use" : (roundStopReason ?? "end_turn");
                 yield Buffer.from(buildTerminalSse(stop, totalOutputTokens, totalInputTokens, totalCachedTokens, messageId, model), "utf8");
+                // Request ledger: one entry per completed request with the
+                // accumulated usage across all compress rounds.
+                if (ctx.usage) {
+                    void captureUsage({
+                        protocol: "anthropic",
+                        usage: {
+                            input_tokens: totalInputTokens,
+                            output_tokens: totalOutputTokens,
+                            cache_read_input_tokens: totalCachedTokens,
+                            cache_creation_input_tokens: totalCacheCreationTokens,
+                        },
+                        sessionId: ctx.session.id,
+                        ctx: ctx.usage,
+                        streaming: true,
+                    });
+                }
                 return;
             }
 
@@ -353,7 +446,7 @@ interface RouteCallbacks {
     onOutputTokens: (n: number) => void;
     onMessageId: (id: string) => void;
     onStopReason: (r: string) => void;
-    onCacheUsage: (input: number | undefined, cached: number | undefined) => void;
+    onCacheUsage: (input: number | undefined, cached: number | undefined, cacheCreation: number | undefined) => void;
 }
 
 function routeAnthropicEvent(
@@ -370,7 +463,11 @@ function routeAnthropicEvent(
         const msg = (data.message ?? {}) as Record<string, unknown>;
         if (typeof msg.id === "string") cb.onMessageId(msg.id);
         const u = (msg.usage ?? {}) as Record<string, unknown>;
-        cb.onCacheUsage(u.input_tokens as number | undefined, u.cache_read_input_tokens as number | undefined);
+        cb.onCacheUsage(
+            u.input_tokens as number | undefined,
+            u.cache_read_input_tokens as number | undefined,
+            u.cache_creation_input_tokens as number | undefined,
+        );
         // message_start is only valid once per SSE response. Forward it in
         // round 1; suppress in all subsequent rounds (client already has it).
         return isFirstRound ? [Buffer.from(eventStr + "\n\n", "utf8")] : [];
@@ -432,6 +529,7 @@ function routeAnthropicEvent(
         cb.onCacheUsage(
             u.input_tokens as number | undefined,
             u.cache_read_input_tokens as number | undefined,
+            u.cache_creation_input_tokens as number | undefined,
         );
         const d = (data.delta ?? {}) as Record<string, unknown>;
         if (typeof d.stop_reason === "string") cb.onStopReason(d.stop_reason);

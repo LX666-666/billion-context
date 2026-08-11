@@ -6,6 +6,7 @@ import { join, relative, sep } from "node:path";
 import { SessionStore } from "../src/persist.ts";
 import { createInitialState } from "acp-kernel";
 import type { Session, BlockContent } from "../src/session.ts";
+import { createInitialWorkflowState } from "../src/workflow/state.ts";
 
 /** Recursively collect *.json files under dir (sessions are namespaced into
  *  protocol/ subdirs). */
@@ -26,6 +27,7 @@ function makeSession(id: string): Session {
         meta: {},
         stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
         metadata: {},
+        workflow: createInitialWorkflowState(),
         state: createInitialState(),
         createdAt: Date.now(),
         lastSeen: Date.now(),
@@ -85,6 +87,19 @@ await withTempStore("loadSync restores a persisted session", async (store) => {
     assert.equal(loaded!.stats.tokensSaved, 999);
     assert.equal(loaded!.state.nextBlockId, 3);
     assert.ok(loaded!.blockContents instanceof Map, "blockContents restored as a Map");
+});
+
+await withTempStore("workflow state survives session persistence", async (store) => {
+    const s = makeSession("workflow-persist");
+    s.workflow.projectId = "project-test";
+    s.workflow.metrics.rawToolTokens = 50_000;
+    s.workflow.metrics.visibleToolTokens = 2_000;
+    await store.writeNow(s);
+
+    const loaded = store.loadSync("workflow-persist");
+    assert.equal(loaded?.workflow.projectId, "project-test");
+    assert.equal(loaded?.workflow.metrics.rawToolTokens, 50_000);
+    assert.equal(loaded?.workflow.metrics.visibleToolTokens, 2_000);
 });
 
 await withTempStore("loadSync returns null for unknown id", async (store) => {

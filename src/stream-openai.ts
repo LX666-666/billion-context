@@ -1,12 +1,40 @@
-import type { CompressionCore, Config, CoreMessage } from "acp-kernel";
-import type { Session } from "./session.js";
-import { COMPRESS_TOOL_NAME, parseCompressInput } from "./compress-tool.js";
+import { buildStatusReport, estimateTokensFast, type CompressionCore, type Config, type CoreMessage } from "acp-kernel";
+import { markDirty, type Session } from "./session.js";
+import { COMPRESS_TOOL_NAME, parseCompressInput, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { applyRanges, type RewriteCtx } from "./stream.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { safeJsonParse } from "./util.js";
+import { resolveDecompress } from "./decompress-shared.js";
+import { expandOperation, retrieveRawOutput } from "./workflow/archive.js";
+
+function executeOpenaiProxyTool(toolName: string, args: Record<string, unknown>, ctx: RewriteCtx): string {
+    if (toolName === COMPRESS_TOOL_NAME) return applyRanges(parseCompressInput(args), ctx);
+    if (toolName === "decompress") return resolveDecompress(args, ctx);
+    if (toolName === "search_context") {
+        const query = typeof args.query === "string" ? args.query : "";
+        if (!query) return "[search_context FAILED: query is required]";
+        const limit = typeof args.limit === "number" && args.limit > 0 ? Math.floor(args.limit) : 5;
+        const blocks = ctx.core.search(query, ctx.session.state).slice(0, limit);
+        return blocks.length > 0 ? JSON.stringify(blocks, null, 2) : `[No blocks matched "${query}"]`;
+    }
+    if (toolName === "acp_status") return buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast);
+    if (toolName === "retrieve_raw") {
+        const rawRef = typeof args.rawRef === "string" ? args.rawRef : "";
+        if (!rawRef) return "[retrieve_raw FAILED: rawRef is required]";
+        const result = retrieveRawOutput(ctx.session.id, ctx.session.workflow, rawRef);
+        markDirty(ctx.session);
+        return result;
+    }
+    if (toolName === "expand_operation") {
+        const opId = typeof args.opId === "string" ? args.opId : "";
+        return opId ? expandOperation(ctx.session.workflow, opId) : "[expand_operation FAILED: opId is required]";
+    }
+    return `[Unknown proxy tool: ${toolName}]`;
+}
 
 type StreamState = {
-    compressIndices: Set<number>;
+    proxyIndices: Set<number>;
+    toolNames: Record<number, string>;
     args: Record<number, string>;
     converted: boolean;
     sawReal: boolean;
@@ -17,7 +45,8 @@ type StreamState = {
 
 function newState(): StreamState {
     return {
-        compressIndices: new Set(),
+        proxyIndices: new Set(),
+        toolNames: {},
         args: {},
         converted: false,
         sawReal: false,
@@ -110,7 +139,8 @@ function routeOpenaiEvent(rawEvent: string, state: StreamState): string | null {
         // single SSE chunk can carry multiple tool calls (different indices);
         // reading only [0] dropped the args of the 2nd+ and failed to mark
         // them as real/compress.
-        let allCompress = true;
+        let allProxy = true;
+        const passthroughCalls: Record<string, unknown>[] = [];
         for (const raw of delta.tool_calls) {
             const entry = raw as {
                 index?: number;
@@ -118,26 +148,27 @@ function routeOpenaiEvent(rawEvent: string, state: StreamState): string | null {
             };
             const tidx = entry.index ?? 0;
             const name = entry.function?.name;
-            if (typeof name === "string") {
-                if (name === COMPRESS_TOOL_NAME) {
-                    state.compressIndices.add(tidx);
-                    state.converted = true;
-                } else {
-                    state.sawReal = true;
-                }
+            if (typeof name === "string" && PROXY_TOOL_NAMES.has(name)) {
+                state.proxyIndices.add(tidx);
+                state.toolNames[tidx] = name;
+                state.converted = true;
             }
-            if (state.compressIndices.has(tidx)) {
+            if (state.proxyIndices.has(tidx)) {
                 const frag = entry.function?.arguments;
                 if (typeof frag === "string") state.args[tidx] = (state.args[tidx] ?? "") + frag;
             } else {
-                allCompress = false;
+                allProxy = false;
+                passthroughCalls.push(raw);
+                if (typeof name === "string") state.sawReal = true;
             }
         }
-        // Suppress the whole event only if every tool call in this chunk is a
-        // compress call. If a real tool call shares the chunk, pass it through
-        // verbatim (multi-tool-per-chunk is rare; rewriting a partial delta
-        // is fragile, so we accept the edge case rather than risk corruption).
-        if (allCompress) return null;
+        if (allProxy) return null;
+        if (passthroughCalls.length !== delta.tool_calls.length) {
+            delta.tool_calls = passthroughCalls;
+            return rawEvent.split("\n").map((line) => line.startsWith("data:")
+                ? `data: ${JSON.stringify(obj)}`
+                : line).join("\n") + "\n\n";
+        }
         return rawEvent + "\n\n";
     }
     return rawEvent + "\n\n";
@@ -147,16 +178,14 @@ function buildOpenaiTail(state: StreamState, ctx: RewriteCtx): string {
     if (!state.converted) return "";
     const base = (state.finishObj ?? { object: "chat.completion.chunk" }) as Record<string, unknown>;
     let out = "";
-    const sortedIndices = [...state.compressIndices].sort((a, b) => a - b);
+    const sortedIndices = [...state.proxyIndices].sort((a, b) => a - b);
     for (const tidx of sortedIndices) {
         const raw = state.args[tidx] ?? "";
-        let parsed: unknown = {};
-        try {
-            parsed = raw ? JSON.parse(raw) : {};
-        } catch {
-            parsed = {};
-        }
-        const note = applyRanges(parseCompressInput(parsed), ctx);
+        const parsed = safeJsonParse(raw);
+        const args = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+            ? parsed as Record<string, unknown>
+            : {};
+        const note = executeOpenaiProxyTool(state.toolNames[tidx] ?? "", args, ctx);
         out += `data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { content: note + "\n" }, finish_reason: null }] })}\n\n`;
     }
     let finalReason: string;
@@ -196,9 +225,13 @@ export function rewriteOpenaiJsonResponse(body: unknown, ctx: RewriteCtx): unkno
     const toolCalls = msg.tool_calls as Array<{ function?: { name?: string; arguments?: string } }> | undefined;
     if (Array.isArray(toolCalls)) {
         for (const tc of toolCalls) {
-            if (tc.function?.name === COMPRESS_TOOL_NAME) {
+            if (tc.function?.name && PROXY_TOOL_NAMES.has(tc.function.name)) {
                 converted = true;
-                noteParts.push(applyRanges(parseCompressInput(safeJsonParse(tc.function?.arguments ?? "")), ctx));
+                const parsed = safeJsonParse(tc.function.arguments ?? "");
+                const args = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+                    ? parsed as Record<string, unknown>
+                    : {};
+                noteParts.push(executeOpenaiProxyTool(tc.function.name, args, ctx));
             } else {
                 sawReal = true;
                 keepToolCalls.push(tc);

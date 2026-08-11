@@ -19,9 +19,9 @@ Agent (Claude Code / Codex / Cursor / Aider ...)
         │  you point the agent's base URL at the proxy
         ▼
 ┌─────────────────┐
-│  billion-context│   1. parse the request (Anthropic or OpenAI shape)
-│     proxy       │   2. run acp-kernel compression on the conversation
-│                 │   3. inject a `compress` tool + compression philosophy
+│  billion-context│   1. parse Anthropic / Chat / Responses requests
+│     proxy       │   2. prune large tool output before model ingest
+│                 │   3. run workflow GC + acp-kernel compression
 │                 │   4. forward to the real model API
 │                 │   5. rewrite the streaming response
 └─────────────────┘
@@ -30,7 +30,18 @@ Agent (Claude Code / Codex / Cursor / Aider ...)
    real model API (Anthropic / OpenAI / compatible)
 ```
 
-The proxy injects four context-management tools (`compress`, `decompress`, `search_context`, `acp_status`) into the conversation. The model calls `compress` when the conversation grows, and the proxy executes it server-side — the compressed ranges are folded into the conversation history before the next turn.
+The proxy injects six context tools (`compress`, `decompress`, `search_context`, `acp_status`, `retrieve_raw`, and `expand_operation`). Responses clients also get `workflow_checkpoint`; Codex code mode uses an equivalent intercepted text protocol so its native tools remain available.
+
+### Workflow-aware context management
+
+- BUILD, TEST, INSTALL, SEARCH and LIST output is cleaned and structured before it first reaches the expensive coding model. Semantic raw output is archived and recoverable by `raw_ref`.
+- READ, PATCH, WRITE and DIFF content is never semantically pruned by a cheap model.
+- An optional OpenAI-compatible cheap pruner handles only still-large low-value tool output. It receives the current output, phase objective and a bounded requirement hint—not the full session—and falls back unchanged if protected diagnostic lines are lost.
+- Codex `update_plan` calls define phase boundaries. A completed phase is checkpointed, then its old read/patch/log working set is rolled over in one cache-aware batch.
+- A later phase re-reads current repository files. Repository state always wins over historical checkpoints.
+- High-fidelity requirements and recent checkpoints persist across sessions through project memory. Old source snapshots are not injected into a new session.
+
+Codex Responses is the primary workflow adapter. Anthropic and OpenAI Chat share the same deterministic pre-ingest pruning core.
 
 ## Install
 
@@ -326,6 +337,23 @@ with no file at all).
 | `BILI_PERSIST_DEBOUNCE_MS` | `500` | Debounce window for writes to disk (ms) |
 | `BILI_MAX_SESSIONS` | `256` | Max sessions held in memory (LRU eviction; disk is source of truth) |
 | `BILI_SESSIONS_DIR` | *(XDG data dir)* | Directory for persisted session state |
+| `BILI_WORKFLOW_ENABLED` | `1` | Enable workflow-aware context management |
+| `BILI_WORKFLOW_TARGET_RATIO` | `0.20` | Target active-context ratio used by the rollover scheduler |
+| `BILI_WORKFLOW_PHASE_GC` | `1` | Enable phase-boundary garbage collection |
+| `BILI_WORKFLOW_SESSION_GC` | `1` | Enable session/project history compaction policy |
+| `BILI_WORKFLOW_REREAD_AFTER_PHASE` | `1` | Require repository re-read semantics after a phase rollover |
+| `BILI_WORKFLOW_PRUNER` | `1` | Enable deterministic pre-ingest tool pruning |
+| `BILI_WORKFLOW_PRUNER_MIN_TOKENS` | `2000` | Minimum cleaned tool-output size for semantic structuring |
+| `BILI_WORKFLOW_CHEAP_MODEL_ENABLED` | `0` | Enable the optional OpenAI-compatible cheap-output pruner |
+| `BILI_WORKFLOW_CHEAP_MODEL_ENDPOINT` | *(none)* | Full chat-completions endpoint; local, free-tier, nano or custom APIs are supported |
+| `BILI_WORKFLOW_CHEAP_MODEL_NAME` | *(none)* | Cheap model name sent to the endpoint |
+| `BILI_WORKFLOW_CHEAP_MODEL_API_KEY` | *(none)* | Optional bearer token for the cheap-model endpoint |
+| `BILI_WORKFLOW_CHEAP_MODEL_MIN_TOKENS` | `8000` | Minimum remaining output size before the cheap model is considered |
+| `BILI_WORKFLOW_CHEAP_MODEL_MAX_OUTPUT_TOKENS` | `2000` | Maximum cheap-pruner response tokens |
+| `BILI_WORKFLOW_CHEAP_MODEL_TIMEOUT_MS` | `30000` | Cheap-pruner request timeout |
+| `BILI_WORKFLOW_ROLLOVER_MIN_TOKENS` | `12000` | Pending-drop size that triggers phase rollover |
+| `BILI_WORKFLOW_ARCHIVE_RAW` | `1` | Archive semantically pruned raw output |
+| `BILI_WORKFLOW_PROJECT_KEY` | *(auto)* | Explicit stable project identity when Codex metadata/cwd is unavailable |
 
 ### Config file (optional)
 
@@ -340,6 +368,21 @@ The config file is a single JSON object. Example:
 {
   "port": 8787,
   "host": "127.0.0.1",
+  "workflow": {
+    "enabled": true,
+    "context": { "targetRatio": 0.2, "phaseGc": true, "sessionGc": true },
+    "code": { "rereadAfterPhase": true },
+    "pruner": {
+      "enabled": true,
+      "minTokens": 2000,
+      "cheapModel": {
+        "enabled": false,
+        "endpoint": "http://127.0.0.1:11434/v1/chat/completions",
+        "model": "qwen3:4b"
+      }
+    },
+    "archive": { "semanticRaw": true }
+  },
   "providers": {
     "https://open.bigmodel.cn/api/coding/paas/v4": {
       "models": {
@@ -364,6 +407,7 @@ The config file is a single JSON object. Example:
 | `passthrough` | `false` | Forward without compression (same as `ACP_PASSTHROUGH=1`) |
 | `providers` | *(none)* | Per-URL context overrides — see below |
 | `compress` | *(see defaults)* | `{ injectTool, injectNudge }` |
+| `workflow` | *(enabled)* | Phase/checkpoint/GC, deterministic pruning, raw archive and project-memory settings |
 | `proxy` | *(none)* | Upstream HTTP proxy for the proxy's OWN outbound connections to model providers (`http://host:port`). Per-URL `proxy` overrides this. See [Upstream proxy](#upstream-proxy-firewall--gfw). |
 
 > **Choosing a `host`** (IPv6 / containers): the default `127.0.0.1` is
@@ -523,7 +567,7 @@ pass an explicit `x-acp-session` header per conversation to avoid collisions.
 
 ## Status
 
-Early. Protocol handling and compression work against mock tests (146 passing). Real-model integration testing is the next milestone. Expect rough edges.
+Active development. Anthropic, OpenAI Chat and Responses adapters, Codex official transport, workflow checkpoints, raw retrieval, phase rollover, session persistence and project memory are covered by the automated test suite.
 
 See [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) for the pi-extension mode (in-process, tighter integration, the reference implementation).
 

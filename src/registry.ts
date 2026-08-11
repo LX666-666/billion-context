@@ -8,7 +8,14 @@ const REGISTRY_URL = "https://models.dev/models.json";
 const CACHE_FILE = path.join(cacheDir(), "models-dev.json");
 const TTL_MS = 24 * 60 * 60 * 1000;
 
-type ModelEntry = { limit?: { context?: number; output?: number } };
+/** models.dev price fields (USD per token, NOT per million). */
+export type ModelsDevPricing = {
+    prompt?: number;
+    completion?: number;
+    request?: number;
+};
+
+type ModelEntry = { limit?: { context?: number; output?: number }; pricing?: ModelsDevPricing };
 type RegistryShape = Record<string, ModelEntry>;
 
 let cache: RegistryShape | null = null;
@@ -136,6 +143,21 @@ export async function contextFromRegistry(model: string, host?: string): Promise
         const entry = reg[key];
         const ctx = entry?.limit?.context;
         if (typeof ctx === "number" && ctx > 0) return ctx;
+    }
+    return undefined;
+}
+
+/** Look up a model's raw models.dev price fields (per-token USD), if any. */
+export async function pricingFromRegistry(model: string, host?: string): Promise<ModelsDevPricing | undefined> {
+    const reg = await loadRegistry();
+    if (!reg || !model) return undefined;
+    const provider = host ? providerFromHost(host) : undefined;
+    const candidates = provider ? [`${provider}/${model}`, model] : [model];
+    for (const key of candidates) {
+        const pricing = reg[key]?.pricing;
+        if (pricing && (typeof pricing.prompt === "number" || typeof pricing.completion === "number")) {
+            return pricing;
+        }
     }
     return undefined;
 }

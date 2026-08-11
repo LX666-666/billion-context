@@ -3,12 +3,16 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { gzipSync } from "node:zlib";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { createInitialState, defaultConfig } from "acp-kernel";
 import { startServer, isChatGptCodexUpstream, isCodexResponsesLite, shouldInjectPromptCacheKey, resolvePromptCacheKey } from "../src/server.ts";
 import { listSessions } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { _resetUsageStoreForTest } from "../src/usage/store.ts";
 
 type Captured = { url: string; headers: http.IncomingHttpHeaders; body: Buffer };
 
@@ -24,6 +28,12 @@ function close(server: http.Server): Promise<void> {
 test("Codex official transport preserves OAuth headers, decodes bodies, and rebases after compact", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
+    // Isolate the usage ledger to a temp file: the proxy capture path runs
+    // (model + usage present) but must not pollute the real data dir.
+    const usageTmp = mkdtempSync(path.join(tmpdir(), "bili-usage-codex-"));
+    const prevUsageFile = process.env.BILI_USAGE_FILE;
+    process.env.BILI_USAGE_FILE = path.join(usageTmp, "usage.jsonl");
+    _resetUsageStoreForTest();
     const captured: Captured[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -169,6 +179,9 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
     } finally {
         await close(proxy);
         await close(upstream);
+        if (prevUsageFile === undefined) delete process.env.BILI_USAGE_FILE; else process.env.BILI_USAGE_FILE = prevUsageFile;
+        _resetUsageStoreForTest();
+        rmSync(usageTmp, { recursive: true, force: true });
     }
 });
 

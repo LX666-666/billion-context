@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { configFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.js";
+import type { WorkflowOptions } from "./workflow/types.js";
 
 export function safeReadJson(path: string): unknown {
     try {
@@ -130,6 +131,7 @@ export type ProxyOptions = {
         injectNudge: boolean;
     };
     promptCache: { routing: PromptCacheRouting };
+    workflow?: WorkflowOptions;
     sessionHeader: string;
     log: boolean;
     debug: boolean;
@@ -244,6 +246,69 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
             throw new Error(`[acp-config] invalid upstream proxy for ${url}: ${String(error)}`);
         }
     }
+    const cheapModelEnabled = (env.BILI_WORKFLOW_CHEAP_MODEL_ENABLED ?? (fileConfig.workflow?.pruner?.cheapModel?.enabled ? "1" : "0")) === "1";
+    const cheapModelEndpoint = nonEmpty(env.BILI_WORKFLOW_CHEAP_MODEL_ENDPOINT) ?? nonEmpty(fileConfig.workflow?.pruner?.cheapModel?.endpoint);
+    const cheapModelName = nonEmpty(env.BILI_WORKFLOW_CHEAP_MODEL_NAME) ?? nonEmpty(fileConfig.workflow?.pruner?.cheapModel?.model);
+    const cheapModelApiKey = nonEmpty(env.BILI_WORKFLOW_CHEAP_MODEL_API_KEY) ?? nonEmpty(fileConfig.workflow?.pruner?.cheapModel?.apiKey);
+    if (cheapModelEnabled && (!cheapModelEndpoint || !cheapModelName)) {
+        throw new Error("[acp-config] workflow.pruner.cheapModel requires endpoint and model when enabled");
+    }
+    if (cheapModelEndpoint) {
+        let parsedCheapEndpoint: URL;
+        try {
+            parsedCheapEndpoint = new URL(cheapModelEndpoint);
+        } catch {
+            throw new Error(`[acp-config] invalid workflow.pruner.cheapModel.endpoint: ${JSON.stringify(cheapModelEndpoint)}`);
+        }
+        if (parsedCheapEndpoint.protocol !== "http:" && parsedCheapEndpoint.protocol !== "https:") {
+            throw new Error(`[acp-config] invalid workflow.pruner.cheapModel.endpoint protocol: ${parsedCheapEndpoint.protocol}`);
+        }
+    }
+    const workflow: WorkflowOptions = {
+        enabled: (env.BILI_WORKFLOW_ENABLED ?? (fileConfig.workflow?.enabled === false ? "0" : "1")) !== "0",
+        targetContextRatio: parseWorkflowRatio(
+            env.BILI_WORKFLOW_TARGET_RATIO ?? fileConfig.workflow?.context?.targetRatio,
+            "workflow.context.targetRatio",
+            0.2,
+        ),
+        phaseGc: (env.BILI_WORKFLOW_PHASE_GC ?? (fileConfig.workflow?.context?.phaseGc === false ? "0" : "1")) !== "0",
+        sessionGc: (env.BILI_WORKFLOW_SESSION_GC ?? (fileConfig.workflow?.context?.sessionGc === false ? "0" : "1")) !== "0",
+        rereadAfterPhase: (env.BILI_WORKFLOW_REREAD_AFTER_PHASE ?? (fileConfig.workflow?.code?.rereadAfterPhase === false ? "0" : "1")) !== "0",
+        deterministicPruner: (env.BILI_WORKFLOW_PRUNER ?? (fileConfig.workflow?.pruner?.enabled === false ? "0" : "1")) !== "0",
+        prunerMinTokens: parseWorkflowInteger(
+            env.BILI_WORKFLOW_PRUNER_MIN_TOKENS ?? fileConfig.workflow?.pruner?.minTokens,
+            "workflow.pruner.minTokens",
+            2_000,
+        ),
+        cheapModel: {
+            enabled: cheapModelEnabled,
+            ...(cheapModelEndpoint ? { endpoint: cheapModelEndpoint } : {}),
+            ...(cheapModelName ? { model: cheapModelName } : {}),
+            ...(cheapModelApiKey ? { apiKey: cheapModelApiKey } : {}),
+            minTokens: parseWorkflowInteger(
+                env.BILI_WORKFLOW_CHEAP_MODEL_MIN_TOKENS ?? fileConfig.workflow?.pruner?.cheapModel?.minTokens,
+                "workflow.pruner.cheapModel.minTokens",
+                8_000,
+            ),
+            maxOutputTokens: parseWorkflowInteger(
+                env.BILI_WORKFLOW_CHEAP_MODEL_MAX_OUTPUT_TOKENS ?? fileConfig.workflow?.pruner?.cheapModel?.maxOutputTokens,
+                "workflow.pruner.cheapModel.maxOutputTokens",
+                2_000,
+            ),
+            timeoutMs: parseWorkflowInteger(
+                env.BILI_WORKFLOW_CHEAP_MODEL_TIMEOUT_MS ?? fileConfig.workflow?.pruner?.cheapModel?.timeoutMs,
+                "workflow.pruner.cheapModel.timeoutMs",
+                30_000,
+            ),
+        },
+        rolloverMinTokens: parseWorkflowInteger(
+            env.BILI_WORKFLOW_ROLLOVER_MIN_TOKENS ?? fileConfig.workflow?.context?.rolloverMinTokens,
+            "workflow.context.rolloverMinTokens",
+            12_000,
+        ),
+        archiveSemanticRaw: (env.BILI_WORKFLOW_ARCHIVE_RAW ?? (fileConfig.workflow?.archive?.semanticRaw === false ? "0" : "1")) !== "0",
+        projectKey: nonEmpty(env.BILI_WORKFLOW_PROJECT_KEY) ?? nonEmpty(fileConfig.workflow?.projectKey),
+    };
     return {
         port: Number.isFinite(port) ? port : 8787,
         host,
@@ -262,6 +327,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         promptCache: {
             routing: parsePromptCacheRouting(env.ACP_PROMPT_CACHE_ROUTING ?? fileConfig.promptCache?.routing),
         },
+        workflow,
         sessionHeader: env.ACP_SESSION_HEADER ?? fileConfig.sessionHeader ?? "x-acp-session",
         log: env.ACP_LOG !== "0" && fileConfig.log !== false,
         debug: (env.ACP_DEBUG ?? (fileConfig.debug ? "1" : "0")) === "1",
@@ -301,6 +367,26 @@ type FileConfig = {
     logFile?: string;
     compress?: { injectTool?: boolean; injectNudge?: boolean };
     promptCache?: { routing?: string };
+    workflow?: {
+        enabled?: boolean;
+        projectKey?: string;
+        context?: { targetRatio?: number; phaseGc?: boolean; sessionGc?: boolean; rolloverMinTokens?: number };
+        code?: { rereadAfterPhase?: boolean };
+        pruner?: {
+            enabled?: boolean;
+            minTokens?: number;
+            cheapModel?: {
+                enabled?: boolean;
+                endpoint?: string;
+                model?: string;
+                apiKey?: string;
+                minTokens?: number;
+                maxOutputTokens?: number;
+                timeoutMs?: number;
+            };
+        };
+        archive?: { semanticRaw?: boolean };
+    };
     mitm?: { enabled?: boolean; domains?: string[] };
 };
 
@@ -309,6 +395,23 @@ function nonEmpty(value: string | undefined): string | undefined {
     return trimmed ? trimmed : undefined;
 }
 
+function parseWorkflowRatio(value: unknown, name: string, fallback: number): number {
+    if (value === undefined || value === null || value === "") return fallback;
+    const parsed = typeof value === "number" ? value : Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 1) {
+        throw new Error(`[acp-config] invalid ${name}: ${JSON.stringify(value)} — must be > 0 and <= 1`);
+    }
+    return parsed;
+}
+
+function parseWorkflowInteger(value: unknown, name: string, fallback: number): number {
+    if (value === undefined || value === null || value === "") return fallback;
+    const parsed = typeof value === "number" ? value : Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isInteger(parsed)) {
+        throw new Error(`[acp-config] invalid ${name}: ${JSON.stringify(value)} — must be a positive integer`);
+    }
+    return parsed;
+}
 function loadConfigFile(): FileConfig {
     const parsed = safeReadJson(configFile());
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
