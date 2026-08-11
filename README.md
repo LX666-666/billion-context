@@ -34,12 +34,13 @@ The proxy injects six context tools (`compress`, `decompress`, `search_context`,
 
 ### Workflow-aware context management
 
-- BUILD, TEST, INSTALL, SEARCH and LIST output is cleaned and structured before it first reaches the expensive coding model. Semantic raw output is archived and recoverable by `raw_ref`.
+- BUILD, TEST, RUN, INSTALL, SEARCH, LIST, JSON and JSONL output is cleaned and structured before it first reaches the expensive coding model. Exact failures, assertions, locations, crash signals and redacted environment clues are preserved; semantic raw output is archived and recoverable by `raw_ref`.
 - READ, PATCH, WRITE and DIFF content is never semantically pruned by a cheap model.
 - An optional OpenAI-compatible cheap pruner handles only still-large low-value tool output. It receives the current output, phase objective and a bounded requirement hint—not the full session—and falls back unchanged if protected diagnostic lines are lost.
 - Codex `update_plan` calls define phase boundaries. A completed phase is checkpointed, then its old read/patch/log working set is rolled over in one cache-aware batch.
-- A later phase re-reads current repository files. Repository state always wins over historical checkpoints.
-- High-fidelity requirements and recent checkpoints persist across sessions through project memory. Old source snapshots are not injected into a new session.
+- Repo Bridge records the workspace/repository root, remote identity, HEAD, dirty state and file signatures. A phase boundary, HEAD change or external file change marks old reads stale; a mutation is blocked until Codex re-reads every affected current file.
+- The rollover scheduler weighs cache-hit ratio, context/tool growth, pending garbage, active debugging, prefix rewrite cost and expected next work. Small phase boundaries can defer GC without losing the pending-drop marker.
+- Project Memory distinguishes continuations from new tasks and compacts Phase → Session → Project checkpoints under a strict injection budget. The optional Cheap Historian only adds a bounded narrative from structured facts; it cannot replace exact requirements, decisions, errors or repository state.
 
 Codex Responses is the primary workflow adapter. Anthropic and OpenAI Chat share the same deterministic pre-ingest pruning core.
 
@@ -66,8 +67,9 @@ Two ways to use it — pick one:
   or when you want to pin an exact value. Routing is the same `/bili/` prefix
   either way — the config only changes which context window the proxy uses.
 
-Compression is injected automatically — you only configure routing, never
-compression itself.
+Core compression is injected automatically. Routing works without workflow
+configuration; the optional workflow, output-pruner model and historian can
+be tuned from the config file, environment variables or Web UI.
 
 ### Option A — Zero-config (`/bili/` prefix)
 
@@ -225,7 +227,11 @@ block. **The key is the upstream URL** — the string the client puts after
 ### Option C — Web UI & context windows
 
 Open [http://localhost:8787/__bili/](http://localhost:8787/__bili/) to
-configure.
+configure. The **Context** page exposes Workflow/Phase GC, the optional output
+compression model, Cheap Historian, Repo Bridge, the cache-aware scheduler and
+per-session telemetry. Saves hot-reload the running proxy. Model API keys are
+write-only: the UI can replace or clear them, but configuration reads never
+return their value.
 
 ### Verify
 
@@ -354,6 +360,26 @@ with no file at all).
 | `BILI_WORKFLOW_ROLLOVER_MIN_TOKENS` | `12000` | Pending-drop size that triggers phase rollover |
 | `BILI_WORKFLOW_ARCHIVE_RAW` | `1` | Archive semantically pruned raw output |
 | `BILI_WORKFLOW_PROJECT_KEY` | *(auto)* | Explicit stable project identity when Codex metadata/cwd is unavailable |
+| `BILI_WORKFLOW_REPO_BRIDGE` | `1` | Track current workspace/repository identity and file freshness |
+| `BILI_WORKFLOW_ENFORCE_REREAD` | `1` | Block mutations that rely on stale pre-phase/HEAD/file reads |
+| `BILI_WORKFLOW_WORKSPACE_ROOT` | *(auto)* | Explicit workspace root when Codex request metadata is unavailable |
+| `BILI_WORKFLOW_REPO_HASH_MAX_BYTES` | `4194304` | Maximum file size hashed by Repo Bridge |
+| `BILI_WORKFLOW_REPO_GIT_TIMEOUT_MS` | `2000` | Timeout for read-only repository probes |
+| `BILI_WORKFLOW_CACHE_PROTECT_HIT_RATIO` | `0.65` | Cache-hit ratio above which a small rollover is expensive to rewrite |
+| `BILI_WORKFLOW_CACHE_HIGH_GROWTH_RATE` | `0.18` | Context growth ratio treated as high pressure |
+| `BILI_WORKFLOW_CACHE_EXPECTED_TOKENS_PER_STEP` | `8000` | Expected token growth per remaining plan step |
+| `BILI_WORKFLOW_CACHE_MAX_EXPECTED_TOKENS` | `64000` | Cap on projected next-work growth |
+| `BILI_WORKFLOW_CACHE_DEBUG_WINDOW` | `10` | Recent operation window used to detect active debugging |
+| `BILI_WORKFLOW_CACHE_REWRITE_WEIGHT` | `1.1` | Weight applied to prompt-prefix rewrite cost |
+| `BILI_WORKFLOW_MEMORY_MAX_INJECTED_TOKENS` | `12000` | Total Project Memory injection budget |
+| `BILI_WORKFLOW_MEMORY_MAX_PROJECT_SESSIONS` | `6` | Recent session checkpoints retained for project injection |
+| `BILI_WORKFLOW_HISTORIAN_ENABLED` | `0` | Enable the optional structured-history model |
+| `BILI_WORKFLOW_HISTORIAN_ENDPOINT` | *(cheap endpoint)* | OpenAI-compatible Historian endpoint; inherits Cheap Pruner endpoint when omitted |
+| `BILI_WORKFLOW_HISTORIAN_MODEL` | *(cheap model)* | Historian model; inherits Cheap Pruner model when omitted |
+| `BILI_WORKFLOW_HISTORIAN_API_KEY` | *(cheap key)* | Optional Historian bearer token |
+| `BILI_WORKFLOW_HISTORIAN_MAX_INPUT_TOKENS` | `16000` | Maximum structured checkpoint input |
+| `BILI_WORKFLOW_HISTORIAN_MAX_OUTPUT_TOKENS` | `2000` | Maximum Historian narrative output |
+| `BILI_WORKFLOW_HISTORIAN_TIMEOUT_MS` | `30000` | Historian request timeout |
 
 ### Config file (optional)
 
@@ -381,7 +407,19 @@ The config file is a single JSON object. Example:
         "model": "qwen3:4b"
       }
     },
-    "archive": { "semanticRaw": true }
+    "archive": { "semanticRaw": true },
+    "repoBridge": { "enabled": true, "enforceReread": true },
+    "cache": {
+      "protectCacheHitRatio": 0.65,
+      "highGrowthRate": 0.18,
+      "expectedTokensPerStep": 8000
+    },
+    "memory": { "maxInjectedTokens": 12000, "maxProjectSessions": 6 },
+    "historian": {
+      "enabled": false,
+      "endpoint": "http://127.0.0.1:11434/v1/chat/completions",
+      "model": "qwen3:4b"
+    }
   },
   "providers": {
     "https://open.bigmodel.cn/api/coding/paas/v4": {
@@ -463,8 +501,9 @@ registry, then the built-in prefix table.
 - Models not covered by any matching key fall back to models.dev, then the
   prefix table, then `modelContextLimit`.
 
-**API keys are never stored in the proxy** — whatever key the agent sends is
-passed through untouched to the upstream.
+**Client upstream API keys are never stored in the proxy** — whatever key the
+agent sends is passed through untouched. Optional Cheap Pruner/Historian
+credentials are separate workflow settings and are write-only in the Web UI.
 
 ### Upstream proxy (firewall / GFW)
 
@@ -567,7 +606,7 @@ pass an explicit `x-acp-session` header per conversation to avoid collisions.
 
 ## Status
 
-Active development. Anthropic, OpenAI Chat and Responses adapters, Codex official transport, workflow checkpoints, raw retrieval, phase rollover, session persistence and project memory are covered by the automated test suite.
+Active development. Anthropic, OpenAI Chat and Responses adapters, Codex official transport, deterministic tool pruning, Repo Bridge guards, cache-aware rollover, layered project memory, Cheap Historian and cross-source usage deduplication are covered by the automated test suite.
 
 See [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) for the pi-extension mode (in-process, tighter integration, the reference implementation).
 
