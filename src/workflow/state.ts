@@ -12,6 +12,8 @@ export function createWorkflowMetrics(): WorkflowMetrics {
         repoRefreshes: 0,
         repoGuardBlocks: 0,
         staleFiles: 0,
+        rolloverEvaluations: 0,
+        rolloverDeferrals: 0,
     };
 }
 
@@ -39,6 +41,15 @@ export function createInitialWorkflowState(): WorkflowState {
             refreshGeneration: 0,
             files: {},
             violations: [],
+        },
+        cacheTelemetry: {
+            sampleCount: 0,
+            recentUsage: [],
+            lastContextTokens: 0,
+            previousContextTokens: 0,
+            contextGrowthTokens: 0,
+            contextGrowthRate: 0,
+            lastVisibleToolTokens: 0,
         },
         metrics: createWorkflowMetrics(),
     };
@@ -75,6 +86,11 @@ export function mergeWorkflowState(value: WorkflowState | undefined): WorkflowSt
             ...(value.repoBridge ?? {}),
             files: value.repoBridge?.files ?? {},
             violations: Array.isArray(value.repoBridge?.violations) ? value.repoBridge.violations : [],
+        },
+        cacheTelemetry: {
+            ...fresh.cacheTelemetry,
+            ...(value.cacheTelemetry ?? {}),
+            recentUsage: Array.isArray(value.cacheTelemetry?.recentUsage) ? value.cacheTelemetry.recentUsage : [],
         },
         metrics: { ...fresh.metrics, ...(value.metrics ?? {}) },
     };

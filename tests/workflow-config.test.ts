@@ -11,6 +11,8 @@ test("workflow defaults are enabled and Codex-ready", () => {
     assert.equal(options.workflow?.rereadAfterPhase, true);
     assert.equal(options.workflow?.repoBridge.enabled, true);
     assert.equal(options.workflow?.repoBridge.enforceReread, true);
+    assert.equal(options.workflow?.cachePolicy.protectCacheHitRatio, 0.65);
+    assert.equal(options.workflow?.cachePolicy.expectedTokensPerStep, 8000);
 });
 
 test("workflow environment settings override context, pruning, archive and project identity", () => {
@@ -38,6 +40,12 @@ test("workflow environment settings override context, pruning, archive and proje
         BILI_WORKFLOW_WORKSPACE_ROOT: "H:\\Auto\\repo-main",
         BILI_WORKFLOW_REPO_HASH_MAX_BYTES: "1048576",
         BILI_WORKFLOW_REPO_GIT_TIMEOUT_MS: "5000",
+        BILI_WORKFLOW_CACHE_PROTECT_HIT_RATIO: "0.75",
+        BILI_WORKFLOW_CACHE_HIGH_GROWTH_RATE: "0.25",
+        BILI_WORKFLOW_CACHE_EXPECTED_TOKENS_PER_STEP: "12000",
+        BILI_WORKFLOW_CACHE_MAX_EXPECTED_TOKENS: "96000",
+        BILI_WORKFLOW_CACHE_DEBUG_WINDOW: "14",
+        BILI_WORKFLOW_CACHE_REWRITE_WEIGHT: "1.4",
     });
     assert.deepEqual(options.workflow, {
         enabled: false,
@@ -66,6 +74,14 @@ test("workflow environment settings override context, pruning, archive and proje
             hashMaxBytes: 1048576,
             gitTimeoutMs: 5000,
         },
+        cachePolicy: {
+            protectCacheHitRatio: 0.75,
+            highGrowthRate: 0.25,
+            expectedTokensPerStep: 12000,
+            maxExpectedNextWorkTokens: 96000,
+            debuggingWindowOperations: 14,
+            rewriteCostWeight: 1.4,
+        },
     });
 });
 
@@ -74,4 +90,6 @@ test("invalid workflow ratios and token thresholds are rejected", () => {
     assert.throws(() => loadOptions({ ACP_AUTO_UPDATE: "0", BILI_WORKFLOW_PRUNER_MIN_TOKENS: "0" }), /minTokens/);
     assert.throws(() => loadOptions({ ACP_AUTO_UPDATE: "0", BILI_WORKFLOW_CHEAP_MODEL_ENABLED: "1" }), /requires endpoint and model/);
     assert.throws(() => loadOptions({ ACP_AUTO_UPDATE: "0", BILI_WORKFLOW_CHEAP_MODEL_ENDPOINT: "file:\/\/bad" }), /endpoint protocol/);
+    assert.throws(() => loadOptions({ ACP_AUTO_UPDATE: "0", BILI_WORKFLOW_CACHE_HIGH_GROWTH_RATE: "0" }), /highGrowthRate/);
+    assert.throws(() => loadOptions({ ACP_AUTO_UPDATE: "0", BILI_WORKFLOW_CACHE_REWRITE_WEIGHT: "11" }), /rewriteCostWeight/);
 });

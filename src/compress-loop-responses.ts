@@ -37,6 +37,7 @@ import { fetchWithTimeout } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { captureUsage, type UsageCaptureCtx } from "./usage/capture.js";
 import { expandOperation, retrieveRawOutput } from "./workflow/archive.js";
+import { recordWorkflowUsage } from "./workflow/cache-policy.js";
 import { recordWorkflowCheckpoint } from "./workflow/context-gc.js";
 import { DEFAULT_WORKFLOW_OPTIONS, type WorkflowOptions } from "./workflow/types.js";
 import { saveProjectMemory } from "./workflow/project-memory.js";
@@ -162,7 +163,7 @@ function executeProxyTool(
             ctx.session.workflow,
             args,
             ctx.workflowOptions ?? DEFAULT_WORKFLOW_OPTIONS,
-            ctx.session.stats.contextTokens,
+            ctx.session.stats.lastInputTokens || ctx.session.stats.contextTokens,
             ctx.config.modelContextLimit,
         );
         const workflowOptions = ctx.workflowOptions ?? DEFAULT_WORKFLOW_OPTIONS;
@@ -652,8 +653,8 @@ export async function* compressLoopResponsesStream(
                             // Record into the session for the web UI / stats.
                             if (typeof prompt === "number") {
                                 ctx.session.stats.inputTokens += prompt;
-                                // tokenCount = TOTAL context (new + cached); see anthropic branch.
-                                ctx.session.stats.lastInputTokens = prompt + (typeof cached === "number" ? cached : 0);
+                                ctx.session.stats.lastInputTokens = prompt;
+                                recordWorkflowUsage(ctx.session.workflow, prompt, typeof cached === "number" ? cached : undefined);
                                 if (typeof cached === "number") ctx.session.stats.cachedTokens += cached;
                                 if (typeof out === "number") ctx.session.stats.outputTokens += out;
                                 ctx.session.stats.cacheSamples += 1;

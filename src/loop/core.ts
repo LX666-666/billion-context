@@ -21,6 +21,7 @@ import { expandOperation, retrieveRawOutput } from "../workflow/archive.js";
 import { recordWorkflowCheckpoint } from "../workflow/context-gc.js";
 import { saveProjectMemory } from "../workflow/project-memory.js";
 import { DEFAULT_WORKFLOW_OPTIONS, type WorkflowOptions } from "../workflow/types.js";
+import { recordWorkflowUsage } from "../workflow/cache-policy.js";
 
 export const MAX_LOOP_ROUNDS = 10;
 
@@ -69,6 +70,7 @@ export interface ExtractedTextTriggers {
 }
 
 export interface CompressLoopAdapter {
+    inputIncludesCached: boolean;
     buildRequest(
         coreMessages: CoreMessage[],
         systemPrompt: string,
@@ -117,7 +119,7 @@ export function executeProxyTool(
             ctx.session.workflow,
             args,
             options,
-            ctx.session.stats.contextTokens,
+            ctx.session.stats.lastInputTokens || ctx.session.stats.contextTokens,
             ctx.config.modelContextLimit,
         );
         if (result.includes("workflow_checkpoint OK") && options.sessionGc) {
@@ -144,19 +146,22 @@ function recordUsage(
     ctx: LoopCtx,
     usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number },
     round: number,
+    inputIncludesCached: boolean,
 ): void {
     const prompt = usage.inputTokens;
     const cached = usage.cachedTokens;
     const out = usage.outputTokens;
     if (typeof prompt === "number") ctx.session.stats.inputTokens += prompt;
-    ctx.session.stats.lastInputTokens =
-        (typeof prompt === "number" ? prompt : 0) + (typeof cached === "number" ? cached : 0);
+    const totalInput = (typeof prompt === "number" ? prompt : 0)
+        + (!inputIncludesCached && typeof cached === "number" ? cached : 0);
+    ctx.session.stats.lastInputTokens = totalInput;
+    recordWorkflowUsage(ctx.session.workflow, totalInput, cached);
     if (typeof cached === "number") ctx.session.stats.cachedTokens += cached;
     if (typeof out === "number") ctx.session.stats.outputTokens += out;
     ctx.session.stats.cacheSamples += 1;
     const hitPct =
-        typeof prompt === "number" && typeof cached === "number" && prompt + cached > 0
-            ? Math.round((cached / (prompt + cached)) * 100)
+        typeof cached === "number" && totalInput > 0
+            ? Math.round((cached / totalInput) * 100)
             : 0;
     ctx.log(
         `[acp-usage] round ${round} input=${ctx.session.stats.lastInputTokens} cached=${cached ?? 0} (cache hit ${hitPct}%)`,
@@ -210,7 +215,7 @@ export async function* runCompressLoop(
                 usage.outputTokens !== undefined ||
                 usage.cachedTokens !== undefined
             ) {
-                recordUsage(ctx, usage, round);
+                recordUsage(ctx, usage, round, adapter.inputIncludesCached);
             }
 
             let resolvedText = assistantText;

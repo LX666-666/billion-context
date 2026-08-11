@@ -100,6 +100,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>): Compr
         );
 
     return {
+        inputIncludesCached: true,
         buildRequest(coreMessages, systemPrompt, body) {
             const messages = coreToOpenai(coreMessages);
             const withSys = injectOpenaiSystem(messages, [systemPrompt]);

@@ -134,6 +134,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
     };
 
     return {
+        inputIncludesCached: false,
         buildRequest(coreMessages, systemPrompt, body) {
             const messages = coreToAnthropic(coreMessages);
             const baseText = originalSystem !== undefined ? extractSystem(originalSystem) : "";

@@ -20,6 +20,7 @@ import { proxyDispatcher } from "./upstream-proxy.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { captureUsage, type UsageCaptureCtx } from "./usage/capture.js";
 import { expandOperation, retrieveRawOutput } from "./workflow/archive.js";
+import { recordWorkflowUsage } from "./workflow/cache-policy.js";
 
 /** Anthropic SSE multi-round compress loop.
  *
@@ -301,6 +302,11 @@ export async function* compressLoopAnthropicStream(
                         // Using only input_tokens makes a cached session look
                         // tiny (e.g. 601 of a 40k context) and never compress.
                         ctx.session.stats.lastInputTokens = input + (typeof cached === "number" ? cached : 0);
+                        recordWorkflowUsage(
+                            ctx.session.workflow,
+                            input + (typeof cached === "number" ? cached : 0),
+                            cached,
+                        );
                         totalInputTokens += input;
                     }
                     if (typeof cached === "number") {

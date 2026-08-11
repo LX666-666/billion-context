@@ -77,6 +77,7 @@ import { syncRequirements } from "./workflow/requirements.js";
 import { buildWorkflowSystemPrompt } from "./workflow/prompt.js";
 import { DEFAULT_WORKFLOW_OPTIONS } from "./workflow/types.js";
 import { preprocessCoreWorkflow } from "./workflow/core-preprocessor.js";
+import { recordWorkflowUsage } from "./workflow/cache-policy.js";
 
 const UPSTREAM_HOP_HEADERS = new Set([
     "host",
@@ -1446,8 +1447,11 @@ async function forward(
                     const promptDetails = u.prompt_tokens_details as Record<string, unknown> | undefined;
                     const inputDetails = u.input_tokens_details as Record<string, unknown> | undefined;
                     const cached = promptDetails?.cached_tokens ?? inputDetails?.cached_tokens ?? u.cache_read_input_tokens;
-                    // tokenCount = TOTAL context (new + cached); see anthropic branch.
-                    prepared.session.stats.lastInputTokens = prompt + (typeof cached === "number" ? cached : 0);
+                    const totalInput = prepared.protocol === "anthropic"
+                        ? prompt + (typeof cached === "number" ? cached : 0)
+                        : prompt;
+                    prepared.session.stats.lastInputTokens = totalInput;
+                    recordWorkflowUsage(prepared.session.workflow, totalInput, typeof cached === "number" ? cached : undefined);
                     if (typeof cached === "number") {
                         prepared.session.stats.cachedTokens += cached;
                         prepared.session.stats.cacheSamples += 1;

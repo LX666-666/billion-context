@@ -147,6 +147,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
     let terminalKind: string | null = null;
 
     return {
+        inputIncludesCached: true,
         buildRequest(coreMessages, systemPrompt, requestBody) {
             const customToolCallIds = new Set<string>();
             for (const m of coreMessages) {

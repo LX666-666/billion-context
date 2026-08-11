@@ -51,12 +51,25 @@ export function updateOperationResult(
     operation: OperationRecord,
     rawTokens: number,
     visibleTokens: number,
+    resultText?: string,
 ): void {
     operation.rawTokens = Math.max(operation.rawTokens, rawTokens);
     operation.visibleTokens = Math.max(operation.visibleTokens, visibleTokens);
     if (operation.lifecycle === "ACTIVE") operation.lifecycle = "CONSUMED";
+    if (resultText !== undefined) operation.outcome = operationOutcome(operation.type, resultText);
     operation.updatedAt = Date.now();
     recomputeWorkflowMetrics(state);
+}
+
+function operationOutcome(type: OperationRecord["type"], text: string): OperationRecord["outcome"] {
+    if (type !== "TEST" && type !== "BUILD" && type !== "RUN" && type !== "INSTALL") return undefined;
+    if (/\[(?:TEST|BUILD) FAILED\]/i.test(text)) return "FAIL";
+    if (/\[(?:TEST|BUILD) PASS\]/i.test(text)) return "PASS";
+    const exitCode = /(?:exit code|exit_code)\s*[:=]\s*(-?\d+)/i.exec(text)?.[1];
+    if (exitCode !== undefined) return exitCode === "0" ? "PASS" : "FAIL";
+    if (/\b(?:failed|failure|fatal|panic|uncaught exception)\b/i.test(text)) return "FAIL";
+    if (/\b(?:passed|success(?:ful)?|completed)\b/i.test(text)) return "PASS";
+    return "UNKNOWN";
 }
 
 export function attachOperationMessageRefs(state: WorkflowState, messages: BiliMessage[]): void {

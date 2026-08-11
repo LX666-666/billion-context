@@ -26,7 +26,7 @@ export async function preprocessCoreWorkflow(
     refreshRepoBridge(session.workflow, workspace ?? options.repoBridge.workspaceRoot, options.repoBridge);
     session.workflow.projectId ??= options.projectKey?.trim() || repoProjectId(session.workflow.repoBridge);
     if (options.sessionGc) hydrateProjectMemory(session.id, session.workflow);
-    applyDeferredRollover(session.workflow, options, session.stats.contextTokens, modelContextLimit);
+    applyDeferredRollover(session.workflow, options, session.stats.lastInputTokens || session.stats.contextTokens, modelContextLimit);
     for (const message of messages) {
         if (message.contentType !== "tool-call" || !message.toolCallId) continue;
         const operation = trackOperationCall(session.workflow, message.toolCallId, message.toolName ?? "unknown", message.text ?? "{}");
@@ -60,7 +60,7 @@ export async function preprocessCoreWorkflow(
             const rawRef = archiveOperationOutput(session.id, session.workflow, operation, raw, result.rawTokens);
             if (rawRef) result = attachRawReference(result, rawRef);
         }
-        updateOperationResult(session.workflow, operation, result.rawTokens, result.visibleTokens);
+        updateOperationResult(session.workflow, operation, result.rawTokens, result.visibleTokens, result.text);
         transformed.push(result.text === raw ? message : { ...message, text: result.text });
     }
     const filtered = transformed.filter((message) => {

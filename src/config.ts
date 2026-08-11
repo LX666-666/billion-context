@@ -323,6 +323,38 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
                 2_000,
             ),
         },
+        cachePolicy: {
+            protectCacheHitRatio: parseWorkflowRatio(
+                env.BILI_WORKFLOW_CACHE_PROTECT_HIT_RATIO ?? fileConfig.workflow?.cache?.protectCacheHitRatio,
+                "workflow.cache.protectCacheHitRatio",
+                0.65,
+            ),
+            highGrowthRate: parseWorkflowRatio(
+                env.BILI_WORKFLOW_CACHE_HIGH_GROWTH_RATE ?? fileConfig.workflow?.cache?.highGrowthRate,
+                "workflow.cache.highGrowthRate",
+                0.18,
+            ),
+            expectedTokensPerStep: parseWorkflowInteger(
+                env.BILI_WORKFLOW_CACHE_EXPECTED_TOKENS_PER_STEP ?? fileConfig.workflow?.cache?.expectedTokensPerStep,
+                "workflow.cache.expectedTokensPerStep",
+                8_000,
+            ),
+            maxExpectedNextWorkTokens: parseWorkflowInteger(
+                env.BILI_WORKFLOW_CACHE_MAX_EXPECTED_TOKENS ?? fileConfig.workflow?.cache?.maxExpectedNextWorkTokens,
+                "workflow.cache.maxExpectedNextWorkTokens",
+                64_000,
+            ),
+            debuggingWindowOperations: parseWorkflowInteger(
+                env.BILI_WORKFLOW_CACHE_DEBUG_WINDOW ?? fileConfig.workflow?.cache?.debuggingWindowOperations,
+                "workflow.cache.debuggingWindowOperations",
+                10,
+            ),
+            rewriteCostWeight: parseWorkflowPositive(
+                env.BILI_WORKFLOW_CACHE_REWRITE_WEIGHT ?? fileConfig.workflow?.cache?.rewriteCostWeight,
+                "workflow.cache.rewriteCostWeight",
+                1.1,
+            ),
+        },
     };
     return {
         port: Number.isFinite(port) ? port : 8787,
@@ -408,6 +440,14 @@ type FileConfig = {
             hashMaxBytes?: number;
             gitTimeoutMs?: number;
         };
+        cache?: {
+            protectCacheHitRatio?: number;
+            highGrowthRate?: number;
+            expectedTokensPerStep?: number;
+            maxExpectedNextWorkTokens?: number;
+            debuggingWindowOperations?: number;
+            rewriteCostWeight?: number;
+        };
     };
     mitm?: { enabled?: boolean; domains?: string[] };
 };
@@ -431,6 +471,15 @@ function parseWorkflowInteger(value: unknown, name: string, fallback: number): n
     const parsed = typeof value === "number" ? value : Number(value);
     if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isInteger(parsed)) {
         throw new Error(`[acp-config] invalid ${name}: ${JSON.stringify(value)} — must be a positive integer`);
+    }
+    return parsed;
+}
+
+function parseWorkflowPositive(value: unknown, name: string, fallback: number): number {
+    if (value === undefined || value === null || value === "") return fallback;
+    const parsed = typeof value === "number" ? value : Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 10) {
+        throw new Error(`[acp-config] invalid ${name}: ${JSON.stringify(value)} — must be > 0 and <= 10`);
     }
     return parsed;
 }

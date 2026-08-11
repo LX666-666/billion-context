@@ -310,7 +310,7 @@ test("loop #9 (S2): responses round yields usage → session.stats populated (nu
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
-        assert.ok(ctx.session.stats.lastInputTokens > 0, "lastInputTokens populated from response.completed usage (S2)");
+        assert.equal(ctx.session.stats.lastInputTokens, 42, "Responses input_tokens already includes cached tokens");
     } finally {
         globalThis.fetch = orig;
     }

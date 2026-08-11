@@ -163,7 +163,7 @@ export async function preprocessResponsesWorkflow(
         || repoProjectId(state.repoBridge)
         || projectIdentity(workspace);
     if (options.sessionGc) hydrateProjectMemory(session.id, state);
-    applyDeferredRollover(state, options, session.stats.contextTokens, modelContextLimit);
+    applyDeferredRollover(state, options, session.stats.lastInputTokens || session.stats.contextTokens, modelContextLimit);
     const sourceInput = body.input.filter((item) => {
         return !((item as Record<string, unknown>).bili_workflow === true);
     });
@@ -213,7 +213,7 @@ export async function preprocessResponsesWorkflow(
             const rawRef = archiveOperationOutput(session.id, state, operation, output.output, result.rawTokens);
             if (rawRef) result = attachRawReference(result, rawRef);
         }
-        updateOperationResult(state, operation, result.rawTokens, result.visibleTokens);
+        updateOperationResult(state, operation, result.rawTokens, result.visibleTokens, result.text);
         if (result.semanticPruned) prunedOperations++;
         transformed.push(result.text === output.output ? item : { ...item, output: result.text });
     }

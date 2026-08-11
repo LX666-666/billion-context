@@ -33,6 +33,7 @@ export type OperationRecord = {
     visibleTokens: number;
     lifecycle: OperationLifecycle;
     importance: "NORMAL" | "CRITICAL";
+    outcome?: "PASS" | "FAIL" | "UNKNOWN";
     repositoryGuard?: {
         status: "BLOCKED_REREAD" | "SATISFIED";
         paths: string[];
@@ -128,6 +129,52 @@ export type WorkflowMetrics = {
     repoRefreshes: number;
     repoGuardBlocks: number;
     staleFiles: number;
+    rolloverEvaluations: number;
+    rolloverDeferrals: number;
+};
+
+export type CacheUsageSample = {
+    totalInputTokens: number;
+    freshInputTokens: number;
+    cachedInputTokens?: number;
+    cacheHitRatio?: number;
+    recordedAt: number;
+};
+
+export type CachePolicyDecision = {
+    action: "IDLE" | "DEFER" | "ROLLOVER";
+    score: number;
+    reasons: string[];
+    contextTokens: number;
+    modelContextLimit: number;
+    contextRatio: number;
+    targetContextRatio: number;
+    cachedTokens?: number;
+    cacheHitRatio?: number;
+    pendingDropTokens: number;
+    pendingPhaseCount: number;
+    phaseBoundary: boolean;
+    contextGrowthTokens: number;
+    contextGrowthRate: number;
+    toolOutputGrowthTokens: number;
+    debuggingActive: boolean;
+    rewriteCostTokens: number;
+    expectedNextWorkTokens: number;
+    projectedContextTokens: number;
+    evaluatedAt: number;
+};
+
+export type CacheTelemetry = {
+    sampleCount: number;
+    recentUsage: CacheUsageSample[];
+    lastContextTokens: number;
+    previousContextTokens: number;
+    lastCachedTokens?: number;
+    lastCacheHitRatio?: number;
+    contextGrowthTokens: number;
+    contextGrowthRate: number;
+    lastVisibleToolTokens: number;
+    lastDecision?: CachePolicyDecision;
 };
 
 export type RepoFileSnapshot = {
@@ -221,6 +268,7 @@ export type WorkflowState = {
     projectMemoryLoadedAt?: number;
     projectHistory?: ProjectHistorySnapshot;
     repoBridge: RepoBridgeState;
+    cacheTelemetry: CacheTelemetry;
     metrics: WorkflowMetrics;
 };
 
@@ -251,6 +299,14 @@ export type WorkflowOptions = {
         hashMaxBytes: number;
         gitTimeoutMs: number;
     };
+    cachePolicy: {
+        protectCacheHitRatio: number;
+        highGrowthRate: number;
+        expectedTokensPerStep: number;
+        maxExpectedNextWorkTokens: number;
+        debuggingWindowOperations: number;
+        rewriteCostWeight: number;
+    };
 };
 
 export const DEFAULT_WORKFLOW_OPTIONS: WorkflowOptions = {
@@ -274,5 +330,13 @@ export const DEFAULT_WORKFLOW_OPTIONS: WorkflowOptions = {
         enforceReread: true,
         hashMaxBytes: 4 * 1024 * 1024,
         gitTimeoutMs: 2_000,
+    },
+    cachePolicy: {
+        protectCacheHitRatio: 0.65,
+        highGrowthRate: 0.18,
+        expectedTokensPerStep: 8_000,
+        maxExpectedNextWorkTokens: 64_000,
+        debuggingWindowOperations: 10,
+        rewriteCostWeight: 1.1,
     },
 };

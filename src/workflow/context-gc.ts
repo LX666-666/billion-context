@@ -1,4 +1,5 @@
 import { estimateTokensFast } from "acp-kernel";
+import { evaluateCachePolicy } from "./cache-policy.js";
 import { recomputeWorkflowMetrics } from "./state.js";
 import type { OperationRecord, WorkflowCheckpoint, WorkflowOptions, WorkflowState } from "./types.js";
 
@@ -51,14 +52,6 @@ function archivePendingPhase(state: WorkflowState, phaseId: string): void {
     state.metrics.rollovers++;
 }
 
-function shouldRollover(state: WorkflowState, options: WorkflowOptions, contextTokens: number, modelContextLimit: number): boolean {
-    const pendingPhases = Object.values(state.phases).filter((phase) => phase.status === "PENDING_ROLLOVER");
-    if (pendingPhases.length > 1) return true;
-    if (state.sessionStatus === "COMPLETE_CANDIDATE") return true;
-    if (state.metrics.pendingDropTokens >= options.rolloverMinTokens) return true;
-    return modelContextLimit > 0 && contextTokens / modelContextLimit >= options.targetContextRatio;
-}
-
 export function applyDeferredRollover(
     state: WorkflowState,
     options: WorkflowOptions,
@@ -66,7 +59,8 @@ export function applyDeferredRollover(
     modelContextLimit: number,
 ): boolean {
     recomputeWorkflowMetrics(state);
-    if (!options.phaseGc || !shouldRollover(state, options, contextTokens, modelContextLimit)) return false;
+    const decision = evaluateCachePolicy(state, options, contextTokens, modelContextLimit);
+    if (decision.action !== "ROLLOVER") return false;
     const pending = Object.values(state.phases).filter((phase) => phase.status === "PENDING_ROLLOVER");
     for (const phase of pending) archivePendingPhase(state, phase.phaseId);
     recomputeWorkflowMetrics(state);
