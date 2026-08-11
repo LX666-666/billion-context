@@ -6,7 +6,7 @@ import { pruneWithCheapModel } from "../src/workflow/pruner/cheap-model.ts";
 import { pruneToolOutput } from "../src/workflow/pruner/index.ts";
 import { DEFAULT_WORKFLOW_OPTIONS, type OperationRecord } from "../src/workflow/types.ts";
 
-function operation(type: OperationRecord["type"]): OperationRecord {
+function operation(type: OperationRecord["type"], overrides: Partial<OperationRecord> = {}): OperationRecord {
     return {
         opId: "op00001",
         phaseId: "phase00001",
@@ -20,6 +20,7 @@ function operation(type: OperationRecord["type"]): OperationRecord {
         importance: "NORMAL",
         createdAt: 1,
         updatedAt: 1,
+        ...overrides,
     };
 }
 
@@ -80,6 +81,71 @@ test("failed test pruning keeps exact assertion, location and exit code", () => 
     assert.match(result.text, /tests\/FooService\.test\.ts:91:7/);
 });
 
+test("large failed RUN output preserves crash diagnostics, signal and environment clues", () => {
+    const raw = [
+        "Exit code: 134",
+        "Wall time: 18.2s",
+        "Node.js: v22.5.1",
+        "Platform: win32 x64",
+        "cwd: H:\\work\\repo",
+        "API_KEY=must-not-leak",
+        ...Array.from({ length: 600 }, (_, index) => `progress ${index}`),
+        "FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory",
+        "Error: JavaScript heap out of memory",
+        "    at src/worker.ts:44:11",
+        "signal: SIGABRT",
+    ].join("\n");
+    const result = pruneToolOutput(operation("RUN", { command: "node dist/worker.js", workdir: "H:\\work\\repo" }), raw, {
+        ...DEFAULT_WORKFLOW_OPTIONS,
+        prunerMinTokens: 10,
+    }, "raw_run_failure");
+    assert.equal(result.semanticPruned, true);
+    assert.match(result.text, /\[RUN FAILED\]/);
+    assert.match(result.text, /exit_code: 134/);
+    assert.match(result.text, /signal: SIGABRT/);
+    assert.match(result.text, /FATAL ERROR: Reached heap limit/);
+    assert.match(result.text, /src\/worker\.ts:44:11/);
+    assert.match(result.text, /Node\.js: v22\.5\.1/);
+    assert.match(result.text, /Platform: win32 x64/);
+    assert.doesNotMatch(result.text, /must-not-leak/);
+    assert.ok(result.visibleTokens < result.rawTokens / 4);
+});
+
+test("large machine JSON becomes a path-aware redacted structural summary", () => {
+    const raw = JSON.stringify({
+        status: "failed",
+        request_id: "req_exact_123",
+        environment: { node_version: "v22.5.1", platform: "win32", api_key: "must-not-leak" },
+        errors: [{ code: "E_PARSE", message: "Unexpected token }", file: "src/config.ts", line: 42 }],
+        items: Array.from({ length: 1_000 }, (_, index) => ({ id: `item_${index}`, value: index })),
+    }, null, 2);
+    const result = pruneToolOutput(operation("RUN", { command: "node diagnostics.js --json" }), raw, {
+        ...DEFAULT_WORKFLOW_OPTIONS,
+        prunerMinTokens: 10,
+    }, "raw_json_output");
+    assert.equal(result.semanticPruned, true);
+    assert.match(result.text, /\[JSON OUTPUT PRUNED\]/);
+    assert.match(result.text, /top_level_keys: status, request_id, environment, errors, items/);
+    assert.match(result.text, /\$\.errors\[0\]\.code: "E_PARSE"/);
+    assert.match(result.text, /\$\.errors\[0\]\.file: "src\/config\.ts"/);
+    assert.match(result.text, /raw_ref: raw_json_output/);
+    assert.doesNotMatch(result.text, /must-not-leak/);
+    assert.ok(result.visibleTokens < result.rawTokens / 10);
+});
+
+test("large JSONL diagnostics preserve record count and exact error fields", () => {
+    const raw = Array.from({ length: 300 }, (_, index) => JSON.stringify({
+        id: `event_${index}`,
+        status: index === 299 ? "failed" : "ok",
+        ...(index === 299 ? { error_code: "E_LAST", message: "final exact failure", file: "src/end.ts", line: 9 } : {}),
+    })).join("\n");
+    const result = pruneToolOutput(operation("OTHER"), raw, { ...DEFAULT_WORKFLOW_OPTIONS, prunerMinTokens: 10 }, "raw_jsonl_output");
+    assert.match(result.text, /\[JSONL OUTPUT PRUNED\]/);
+    assert.match(result.text, /record_count: 300/);
+    assert.match(result.text, /E_LAST|raw_ref: raw_jsonl_output/);
+    assert.ok(result.visibleTokens < result.rawTokens / 4);
+});
+
 test("optional cheap pruner receives only bounded workflow hints and preserves exact diagnostics", async () => {
     const raw = [
         "Exit code: 1",
@@ -99,7 +165,8 @@ test("optional cheap pruner receives only bounded workflow hints and preserves e
             timeoutMs: 5_000,
         },
     };
-    const base = pruneToolOutput(operation("RUN"), raw, options);
+    const cheapOperation = operation("OTHER", { command: "node opaque-diagnostic.js" });
+    const base = pruneToolOutput(cheapOperation, raw, options);
     assert.equal(base.semanticPruned, false);
     const originalFetch = globalThis.fetch;
     let request: Record<string, unknown> | undefined;
@@ -111,7 +178,7 @@ test("optional cheap pruner receives only bounded workflow hints and preserves e
     }) as typeof fetch;
     let result: Awaited<ReturnType<typeof pruneWithCheapModel>>;
     try {
-        result = await pruneWithCheapModel(operation("RUN"), base, options, {
+        result = await pruneWithCheapModel(cheapOperation, base, options, {
             phaseObjective: "Diagnose the failing command",
             requirementHint: "REQ-00001: Preserve exact errors",
         });

@@ -3,6 +3,9 @@ import { protectsCodeContent } from "../operation-classifier.js";
 import type { OperationRecord, WorkflowOptions } from "../types.js";
 import { cleanDeterministic } from "./deterministic.js";
 import { guardedOperationOutput } from "../repo-bridge.js";
+import { diagnosticLines, duration, environmentLines, exitCode, outputFailed } from "./diagnostics.js";
+import { summarizeMachineJson } from "./json.js";
+import { summarizeRun } from "./run.js";
 
 export type PrunedToolOutput = {
     text: string;
@@ -18,68 +21,60 @@ export function attachRawReference(result: PrunedToolOutput, rawRef: string): Pr
     return { ...result, text, visibleTokens: estimateTokensFast(text) };
 }
 
-function field(text: string, pattern: RegExp): string | undefined {
-    return pattern.exec(text)?.[1]?.trim();
-}
-
-function relevantFailureLines(text: string): string[] {
-    const lines = text.split(/\r?\n/);
-    const matches = lines.filter((line) =>
-        /\b(error|failed|failure|assert|expected|actual|exception|panic|fatal|segmentation|exit code)\b|\bat\s+.+:\d+(?::\d+)?|[A-Za-z0-9_./\\-]+:\d+(?::\d+)?/i.test(line),
-    );
-    return matches.slice(0, 140);
-}
-
 function referenceLine(rawRef: string | undefined): string {
     return rawRef ? `\nraw_ref: ${rawRef}` : "";
 }
 
 function testSummary(text: string, operation: OperationRecord, rawRef: string | undefined): string {
-    const exitCode = field(text, /(?:exit code|exit_code)\s*[:=]\s*(-?\d+)/i);
-    const failed = field(text, /(?:^|\n)\s*(?:fail|failed|failures?)\s*[:=]?\s*(\d+)/im)
-        ?? field(text, /(\d+)\s+failed\b/i);
-    const passed = field(text, /(?:^|\n)\s*(?:passed|pass)\s*[:=]?\s*(\d+)/im)
-        ?? field(text, /(\d+)\s+passed\b/i);
-    const skipped = field(text, /(?:^|\n)\s*skipped\s*[:=]?\s*(\d+)/im)
-        ?? field(text, /(\d+)\s+skipped\b/i);
-    const duration = field(text, /(?:duration|wall time)\s*[:=]\s*([^\r\n]+)/i);
-    const isFailure = (exitCode !== undefined && exitCode !== "0") || (failed !== undefined && failed !== "0") || /\b(test|tests?)\s+failed\b/i.test(text);
+    const code = exitCode(text);
+    const failed = /(?:^|\n)\s*(?:fail|failed|failures?)\s*[:=]?\s*(\d+)/im.exec(text)?.[1]?.trim()
+        ?? /(\d+)\s+failed\b/i.exec(text)?.[1]?.trim();
+    const passed = /(?:^|\n)\s*(?:passed|pass)\s*[:=]?\s*(\d+)/im.exec(text)?.[1]?.trim()
+        ?? /(\d+)\s+passed\b/i.exec(text)?.[1]?.trim();
+    const skipped = /(?:^|\n)\s*skipped\s*[:=]?\s*(\d+)/im.exec(text)?.[1]?.trim()
+        ?? /(\d+)\s+skipped\b/i.exec(text)?.[1]?.trim();
+    const elapsed = duration(text);
+    const isFailure = outputFailed(text, code) || (failed !== undefined && failed !== "0") || /\b(test|tests?)\s+failed\b/i.test(text);
     const lines = [
         isFailure ? "[TEST FAILED]" : "[TEST PASS]",
         `op_id: ${operation.opId}`,
         operation.command ? `command: ${operation.command}` : undefined,
-        exitCode !== undefined ? `exit_code: ${exitCode}` : undefined,
-        duration ? `duration: ${duration}` : undefined,
+        code !== undefined ? `exit_code: ${code}` : undefined,
+        elapsed ? `duration: ${elapsed}` : undefined,
         passed !== undefined ? `passed: ${passed}` : undefined,
         failed !== undefined ? `failed: ${failed}` : undefined,
         skipped !== undefined ? `skipped: ${skipped}` : undefined,
     ].filter((value): value is string => Boolean(value));
     if (isFailure) {
-        const relevant = relevantFailureLines(text);
+        const relevant = diagnosticLines(text);
         if (relevant.length > 0) lines.push("", "exact_errors:", ...relevant);
     }
+    const environment = environmentLines(text);
+    if (environment.length > 0) lines.push("", "environment:", ...environment);
     return `${lines.join("\n")}${referenceLine(rawRef)}`;
 }
 
 function buildSummary(text: string, operation: OperationRecord, rawRef: string | undefined): string {
-    const exitCode = field(text, /(?:exit code|exit_code)\s*[:=]\s*(-?\d+)/i);
-    const duration = field(text, /(?:duration|wall time)\s*[:=]\s*([^\r\n]+)/i);
-    const warnings = field(text, /(?:warnings?|warn)\s*[:=]\s*(\d+)/i);
-    const errors = field(text, /(?:errors?)\s*[:=]\s*(\d+)/i);
-    const isFailure = (exitCode !== undefined && exitCode !== "0") || /\b(build|compile|typecheck)\s+failed\b/i.test(text);
+    const code = exitCode(text);
+    const elapsed = duration(text);
+    const warnings = /(?:warnings?|warn)\s*[:=]\s*(\d+)/i.exec(text)?.[1]?.trim();
+    const errors = /(?:errors?)\s*[:=]\s*(\d+)/i.exec(text)?.[1]?.trim();
+    const isFailure = outputFailed(text, code) || (errors !== undefined && errors !== "0") || /\b(build|compile|typecheck)\s+failed\b/i.test(text);
     const lines = [
         isFailure ? "[BUILD FAILED]" : "[BUILD PASS]",
         `op_id: ${operation.opId}`,
         operation.command ? `command: ${operation.command}` : undefined,
-        exitCode !== undefined ? `exit_code: ${exitCode}` : undefined,
-        duration ? `duration: ${duration}` : undefined,
+        code !== undefined ? `exit_code: ${code}` : undefined,
+        elapsed ? `duration: ${elapsed}` : undefined,
         errors !== undefined ? `errors: ${errors}` : undefined,
         warnings !== undefined ? `warnings: ${warnings}` : undefined,
     ].filter((value): value is string => Boolean(value));
     if (isFailure) {
-        const relevant = relevantFailureLines(text);
+        const relevant = diagnosticLines(text);
         if (relevant.length > 0) lines.push("", "exact_errors:", ...relevant);
     }
+    const environment = environmentLines(text);
+    if (environment.length > 0) lines.push("", "environment:", ...environment);
     return `${lines.join("\n")}${referenceLine(rawRef)}`;
 }
 
@@ -134,10 +129,16 @@ export function pruneToolOutput(
         };
     }
     let text: string | undefined;
-    if (operation.type === "TEST") text = testSummary(cleaned.text, operation, rawRef);
-    else if (operation.type === "BUILD") text = buildSummary(cleaned.text, operation, rawRef);
-    else if (operation.type === "SEARCH" || operation.type === "LIST" || operation.type === "INSTALL") {
-        text = boundedLines(cleaned.text, operation, rawRef);
+    if (operation.type === "RUN" || operation.type === "OTHER" || operation.type === "SEARCH" || operation.type === "LIST") {
+        text = summarizeMachineJson(cleaned.text, operation, rawRef);
+    }
+    if (!text) {
+        if (operation.type === "TEST") text = testSummary(cleaned.text, operation, rawRef);
+        else if (operation.type === "BUILD") text = buildSummary(cleaned.text, operation, rawRef);
+        else if (operation.type === "RUN") text = summarizeRun(cleaned.text, operation, rawRef);
+        else if (operation.type === "SEARCH" || operation.type === "LIST" || operation.type === "INSTALL") {
+            text = boundedLines(cleaned.text, operation, rawRef);
+        }
     }
     if (!text) {
         return {
