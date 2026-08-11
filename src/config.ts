@@ -308,6 +308,21 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         ),
         archiveSemanticRaw: (env.BILI_WORKFLOW_ARCHIVE_RAW ?? (fileConfig.workflow?.archive?.semanticRaw === false ? "0" : "1")) !== "0",
         projectKey: nonEmpty(env.BILI_WORKFLOW_PROJECT_KEY) ?? nonEmpty(fileConfig.workflow?.projectKey),
+        repoBridge: {
+            enabled: (env.BILI_WORKFLOW_REPO_BRIDGE ?? (fileConfig.workflow?.repoBridge?.enabled === false ? "0" : "1")) !== "0",
+            enforceReread: (env.BILI_WORKFLOW_ENFORCE_REREAD ?? (fileConfig.workflow?.repoBridge?.enforceReread === false ? "0" : "1")) !== "0",
+            workspaceRoot: nonEmpty(env.BILI_WORKFLOW_WORKSPACE_ROOT) ?? nonEmpty(fileConfig.workflow?.repoBridge?.workspaceRoot),
+            hashMaxBytes: parseWorkflowInteger(
+                env.BILI_WORKFLOW_REPO_HASH_MAX_BYTES ?? fileConfig.workflow?.repoBridge?.hashMaxBytes,
+                "workflow.repoBridge.hashMaxBytes",
+                4 * 1024 * 1024,
+            ),
+            gitTimeoutMs: parseWorkflowInteger(
+                env.BILI_WORKFLOW_REPO_GIT_TIMEOUT_MS ?? fileConfig.workflow?.repoBridge?.gitTimeoutMs,
+                "workflow.repoBridge.gitTimeoutMs",
+                2_000,
+            ),
+        },
     };
     return {
         port: Number.isFinite(port) ? port : 8787,
@@ -386,6 +401,13 @@ type FileConfig = {
             };
         };
         archive?: { semanticRaw?: boolean };
+        repoBridge?: {
+            enabled?: boolean;
+            enforceReread?: boolean;
+            workspaceRoot?: string;
+            hashMaxBytes?: number;
+            gitTimeoutMs?: number;
+        };
     };
     mitm?: { enabled?: boolean; domains?: string[] };
 };

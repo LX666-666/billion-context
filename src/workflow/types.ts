@@ -24,12 +24,22 @@ export type OperationRecord = {
     toolName?: string;
     path?: string;
     command?: string;
+    workdir?: string;
+    paths: string[];
+    addedPaths: string[];
     rawRef?: string;
     rawChecksum?: string;
     rawTokens: number;
     visibleTokens: number;
     lifecycle: OperationLifecycle;
     importance: "NORMAL" | "CRITICAL";
+    repositoryGuard?: {
+        status: "BLOCKED_REREAD" | "SATISFIED";
+        paths: string[];
+        reason: string;
+        violationId: string;
+    };
+    repositoryObservedAt?: number;
     createdAt: number;
     updatedAt: number;
 };
@@ -115,6 +125,49 @@ export type WorkflowMetrics = {
     rollovers: number;
     checkpointTokens: number;
     rawRetrievals: number;
+    repoRefreshes: number;
+    repoGuardBlocks: number;
+    staleFiles: number;
+};
+
+export type RepoFileSnapshot = {
+    path: string;
+    relativePath: string;
+    exists: boolean;
+    tracked: boolean;
+    size: number;
+    mtimeMs: number;
+    signature: string;
+    lastReadPhaseId?: string;
+    lastMutationPhaseId?: string;
+    stale: boolean;
+    staleReason?: "PHASE_BOUNDARY" | "HEAD_CHANGED" | "FILE_CHANGED";
+    staleGeneration?: number;
+    observedAt: number;
+};
+
+export type RepoGuardViolation = {
+    violationId: string;
+    phaseId: string;
+    opId: string;
+    paths: string[];
+    reason: string;
+    createdAt: number;
+    resolvedAt?: number;
+};
+
+export type RepoBridgeState = {
+    workspaceRoot?: string;
+    repoRoot?: string;
+    remoteIdentity?: string;
+    head?: string;
+    dirty?: boolean;
+    observedAt?: number;
+    lastError?: string;
+    nextViolationNumber: number;
+    refreshGeneration: number;
+    files: Record<string, RepoFileSnapshot>;
+    violations: RepoGuardViolation[];
 };
 
 export type ProjectHistorySession = {
@@ -167,6 +220,7 @@ export type WorkflowState = {
     rawArchive: Record<string, RawArchiveIndexRecord>;
     projectMemoryLoadedAt?: number;
     projectHistory?: ProjectHistorySnapshot;
+    repoBridge: RepoBridgeState;
     metrics: WorkflowMetrics;
 };
 
@@ -190,6 +244,13 @@ export type WorkflowOptions = {
     rolloverMinTokens: number;
     archiveSemanticRaw: boolean;
     projectKey?: string;
+    repoBridge: {
+        enabled: boolean;
+        enforceReread: boolean;
+        workspaceRoot?: string;
+        hashMaxBytes: number;
+        gitTimeoutMs: number;
+    };
 };
 
 export const DEFAULT_WORKFLOW_OPTIONS: WorkflowOptions = {
@@ -208,4 +269,10 @@ export const DEFAULT_WORKFLOW_OPTIONS: WorkflowOptions = {
     },
     rolloverMinTokens: 12_000,
     archiveSemanticRaw: true,
+    repoBridge: {
+        enabled: true,
+        enforceReread: true,
+        hashMaxBytes: 4 * 1024 * 1024,
+        gitTimeoutMs: 2_000,
+    },
 };

@@ -1,22 +1,37 @@
 import type { BiliMessage } from "../bili-message.js";
 import type { Session } from "../session.js";
 import { archiveOperationOutput } from "./archive.js";
+import { applyDeferredRollover, checkpointRequest, workflowMemory } from "./context-gc.js";
 import { attachOperationMessageRefs, operationForCall, trackOperationCall, updateOperationResult } from "./operation-tracker.js";
+import { applyPlanUpdate } from "./plan-tracker.js";
+import { hydrateProjectMemory } from "./project-memory.js";
 import { pruneWithCheapModel } from "./pruner/cheap-model.js";
 import { attachRawReference, pruneToolOutput } from "./pruner/index.js";
 import { syncRequirements } from "./requirements.js";
 import type { WorkflowOptions } from "./types.js";
+import { observeRepositoryOperation, refreshRepoBridge, repoProjectId, repositoryGuardMessage, workspaceRootFromText } from "./repo-bridge.js";
 
 export async function preprocessCoreWorkflow(
     messages: BiliMessage[],
     session: Session,
     options: WorkflowOptions,
+    workspaceSource?: string,
+    modelContextLimit = 0,
 ): Promise<BiliMessage[]> {
     if (!options.enabled) return messages;
-    session.workflow.projectId ??= options.projectKey;
+    const workspace = workspaceRootFromText([
+        workspaceSource,
+        ...messages.filter((message) => message.role === "system").map((message) => message.text),
+    ]);
+    refreshRepoBridge(session.workflow, workspace ?? options.repoBridge.workspaceRoot, options.repoBridge);
+    session.workflow.projectId ??= options.projectKey?.trim() || repoProjectId(session.workflow.repoBridge);
+    if (options.sessionGc) hydrateProjectMemory(session.id, session.workflow);
+    applyDeferredRollover(session.workflow, options, session.stats.contextTokens, modelContextLimit);
     for (const message of messages) {
         if (message.contentType !== "tool-call" || !message.toolCallId) continue;
-        trackOperationCall(session.workflow, message.toolCallId, message.toolName ?? "unknown", message.text ?? "{}");
+        const operation = trackOperationCall(session.workflow, message.toolCallId, message.toolName ?? "unknown", message.text ?? "{}");
+        if (message.toolName === "update_plan") applyPlanUpdate(session.workflow, message.toolCallId, message.text ?? "{}");
+        observeRepositoryOperation(session.workflow, operation, options.repoBridge);
     }
     const phaseObjective = session.workflow.activePhaseId
         ? session.workflow.phases[session.workflow.activePhaseId]?.objective
@@ -52,6 +67,20 @@ export async function preprocessCoreWorkflow(
         if (!message.toolCallId || (message.contentType !== "tool-call" && message.contentType !== "tool-result")) return true;
         return operationForCall(session.workflow, message.toolCallId)?.lifecycle !== "ARCHIVED";
     });
+    const tails = [
+        workflowMemory(session.workflow, options.rereadAfterPhase),
+        checkpointRequest(session.workflow, false),
+        repositoryGuardMessage(session.workflow),
+    ].filter((value): value is string => Boolean(value));
+    for (const [index, tail] of tails.entries()) {
+        filtered.push({
+            id: `workflow_tail_${Date.now()}_${index}`,
+            role: "user",
+            contentType: "text",
+            text: tail,
+            rawResponsesItem: { bili_workflow: true },
+        });
+    }
     attachOperationMessageRefs(session.workflow, filtered);
     syncRequirements(session.workflow, filtered, session.id);
     return filtered;

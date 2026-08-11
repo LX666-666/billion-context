@@ -9,6 +9,8 @@ test("workflow defaults are enabled and Codex-ready", () => {
     assert.equal(options.workflow?.deterministicPruner, true);
     assert.equal(options.workflow?.cheapModel.enabled, false);
     assert.equal(options.workflow?.rereadAfterPhase, true);
+    assert.equal(options.workflow?.repoBridge.enabled, true);
+    assert.equal(options.workflow?.repoBridge.enforceReread, true);
 });
 
 test("workflow environment settings override context, pruning, archive and project identity", () => {
@@ -31,6 +33,11 @@ test("workflow environment settings override context, pruning, archive and proje
         BILI_WORKFLOW_ROLLOVER_MIN_TOKENS: "24000",
         BILI_WORKFLOW_ARCHIVE_RAW: "0",
         BILI_WORKFLOW_PROJECT_KEY: "repo-main",
+        BILI_WORKFLOW_REPO_BRIDGE: "0",
+        BILI_WORKFLOW_ENFORCE_REREAD: "0",
+        BILI_WORKFLOW_WORKSPACE_ROOT: "H:\\Auto\\repo-main",
+        BILI_WORKFLOW_REPO_HASH_MAX_BYTES: "1048576",
+        BILI_WORKFLOW_REPO_GIT_TIMEOUT_MS: "5000",
     });
     assert.deepEqual(options.workflow, {
         enabled: false,
@@ -52,6 +59,13 @@ test("workflow environment settings override context, pruning, archive and proje
         rolloverMinTokens: 24000,
         archiveSemanticRaw: false,
         projectKey: "repo-main",
+        repoBridge: {
+            enabled: false,
+            enforceReread: false,
+            workspaceRoot: "H:\\Auto\\repo-main",
+            hashMaxBytes: 1048576,
+            gitTimeoutMs: 5000,
+        },
     });
 });
 

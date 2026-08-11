@@ -1,4 +1,5 @@
 import { ensureActivePhase } from "./state.js";
+import { markPhaseRepositoryStateStale } from "./repo-bridge.js";
 import type { PlanStepRecord, PlanStepStatus, WorkflowState } from "./types.js";
 
 type UpdatePlanArgs = {
@@ -40,6 +41,7 @@ function closeActivePhase(state: WorkflowState): void {
     if (!phase || phase.status !== "ACTIVE") return;
     phase.status = "CHECKPOINT_PENDING";
     phase.completedAt = Date.now();
+    markPhaseRepositoryStateStale(state, phase.phaseId);
     if (!state.checkpointQueue.includes(phase.phaseId)) state.checkpointQueue.push(phase.phaseId);
     state.activePhaseId = undefined;
 }

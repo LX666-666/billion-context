@@ -9,6 +9,9 @@ export function createWorkflowMetrics(): WorkflowMetrics {
         rollovers: 0,
         checkpointTokens: 0,
         rawRetrievals: 0,
+        repoRefreshes: 0,
+        repoGuardBlocks: 0,
+        staleFiles: 0,
     };
 }
 
@@ -31,6 +34,12 @@ export function createInitialWorkflowState(): WorkflowState {
         phases: {},
         checkpoints: {},
         rawArchive: {},
+        repoBridge: {
+            nextViolationNumber: 1,
+            refreshGeneration: 0,
+            files: {},
+            violations: [],
+        },
         metrics: createWorkflowMetrics(),
     };
 }
@@ -43,7 +52,14 @@ export function mergeWorkflowState(value: WorkflowState | undefined): WorkflowSt
         ...value,
         seenPlanCallIds: Array.isArray(value.seenPlanCallIds) ? value.seenPlanCallIds : [],
         checkpointQueue: Array.isArray(value.checkpointQueue) ? value.checkpointQueue : [],
-        operations: value.operations ?? {},
+        operations: Object.fromEntries(Object.entries(value.operations ?? {}).map(([opId, operation]) => [
+            opId,
+            {
+                ...operation,
+                paths: Array.isArray(operation.paths) ? operation.paths : operation.path ? [operation.path] : [],
+                addedPaths: Array.isArray(operation.addedPaths) ? operation.addedPaths : [],
+            },
+        ])),
         operationByCallId: value.operationByCallId ?? {},
         itemPhaseByKey: value.itemPhaseByKey ?? {},
         requirements: value.requirements ?? {},
@@ -54,6 +70,12 @@ export function mergeWorkflowState(value: WorkflowState | undefined): WorkflowSt
         ])),
         checkpoints: value.checkpoints ?? {},
         rawArchive: value.rawArchive ?? {},
+        repoBridge: {
+            ...fresh.repoBridge,
+            ...(value.repoBridge ?? {}),
+            files: value.repoBridge?.files ?? {},
+            violations: Array.isArray(value.repoBridge?.violations) ? value.repoBridge.violations : [],
+        },
         metrics: { ...fresh.metrics, ...(value.metrics ?? {}) },
     };
 }

@@ -6,6 +6,7 @@ export function buildWorkflowSystemPrompt(textProtocol: boolean): string {
 
 The repository and current filesystem are the source of truth for code. Context is working memory.
 Keep READ baselines and PATCH chains available within the current phase. After a phase checkpoint and rollover, re-read current repository files before modifying them again.
+Treat <workflow-repository-guard> as a hard context barrier: do not use old requirements, checkpoints, summaries, source reads, diffs, or patch outputs to infer current code. Re-read every stale target, then validate the filesystem state before another PATCH or WRITE. A blocked mutation may already have executed locally, but its output is not evidence of success.
 Do not replace exact user requirements, engineering decisions, exact errors, file paths, identifiers, or unresolved blockers with vague summaries.
 Tool output may include raw_ref and opId references. Use retrieve_raw for exact archived output and expand_operation for operation metadata when those tools are available.
 ${checkpoint}`;

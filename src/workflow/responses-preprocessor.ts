@@ -8,6 +8,13 @@ import { applyPlanUpdate } from "./plan-tracker.js";
 import { pruneWithCheapModel } from "./pruner/cheap-model.js";
 import { attachRawReference, pruneToolOutput } from "./pruner/index.js";
 import { hydrateProjectMemory } from "./project-memory.js";
+import {
+    observeRepositoryOperation,
+    refreshRepoBridge,
+    repoProjectId,
+    repositoryGuardMessage,
+    workspaceRootFromText,
+} from "./repo-bridge.js";
 import type { WorkflowOptions } from "./types.js";
 
 export type WorkflowPreprocessResult = {
@@ -46,29 +53,35 @@ function outputFields(item: ResponseInputItem): { callId: string; output: string
     };
 }
 
-function projectIdentity(body: ResponsesRequestBody, configured?: string): string | undefined {
-    if (configured?.trim()) return configured.trim();
+function workspaceRoot(body: ResponsesRequestBody): string | undefined {
     const metadata = body.metadata;
-    let candidate = metadata?.projectKey ?? metadata?.project_root ?? metadata?.workspace_root ?? metadata?.cwd;
+    let candidate = metadata?.project_root ?? metadata?.workspace_root ?? metadata?.cwd;
     if (typeof candidate !== "string" || !candidate.trim()) {
         const sources = [body.instructions];
         if (Array.isArray(body.input)) {
             for (const item of body.input) {
                 if (item.type !== "message") continue;
-                const content = (item as Record<string, unknown>).content;
-                if (typeof content === "string") sources.push(content);
+                const record = item as Record<string, unknown>;
+                if (record.role !== "system" && record.role !== "developer") continue;
+                const content = record.content;
+                if (typeof content === "string") {
+                    sources.push(content);
+                } else if (Array.isArray(content)) {
+                    sources.push(content.map((part) => {
+                        if (!part || typeof part !== "object") return "";
+                        const text = (part as Record<string, unknown>).text;
+                        return typeof text === "string" ? text : "";
+                    }).join("\n"));
+                }
             }
         }
-        for (const source of sources) {
-            if (typeof source !== "string") continue;
-            const match = /\x3ccwd\x3e([^<]+)\x3c\/cwd\x3e/i.exec(source);
-            if (match?.[1]?.trim()) {
-                candidate = match[1];
-                break;
-            }
-        }
+        candidate = workspaceRootFromText(sources);
     }
-    if (typeof candidate !== "string" || !candidate.trim()) return undefined;
+    return typeof candidate === "string" && candidate.trim() ? candidate.trim() : undefined;
+}
+
+function projectIdentity(candidate: string | undefined): string | undefined {
+    if (!candidate) return undefined;
     const normalized = candidate.trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
     return `project-${createHash("sha256").update(normalized).digest("hex").slice(0, 20)}`;
 }
@@ -142,7 +155,13 @@ export async function preprocessResponsesWorkflow(
         return { body, prunedOperations: 0, archivedOperations: 0 };
     }
     const state = session.workflow;
-    state.projectId ??= projectIdentity(body, options.projectKey);
+    const workspace = workspaceRoot(body) ?? options.repoBridge.workspaceRoot;
+    refreshRepoBridge(state, workspace, options.repoBridge);
+    const metadataProjectKey = typeof body.metadata?.projectKey === "string" ? body.metadata.projectKey : undefined;
+    state.projectId ??= options.projectKey?.trim()
+        || projectIdentity(metadataProjectKey)
+        || repoProjectId(state.repoBridge)
+        || projectIdentity(workspace);
     if (options.sessionGc) hydrateProjectMemory(session.id, state);
     applyDeferredRollover(state, options, session.stats.contextTokens, modelContextLimit);
     const sourceInput = body.input.filter((item) => {
@@ -157,6 +176,7 @@ export async function preprocessResponsesWorkflow(
             const operation = trackOperationCall(state, call.callId, call.name, call.argumentsText);
             assignItemPhase(session, itemKeys[index], operation.phaseId);
             if (call.name === "update_plan") applyPlanUpdate(state, call.callId, call.argumentsText);
+            observeRepositoryOperation(state, operation, options.repoBridge);
             continue;
         }
         const output = outputFields(item);
@@ -209,6 +229,8 @@ export async function preprocessResponsesWorkflow(
     if (memory) filtered.push(workflowItem(memory));
     const request = checkpointRequest(state, textProtocol);
     if (request) filtered.push(workflowItem(request));
+    const guard = repositoryGuardMessage(state);
+    if (guard) filtered.push(workflowItem(guard));
     return {
         body: { ...body, input: filtered },
         prunedOperations,

@@ -2,6 +2,7 @@ import { estimateTokensFast } from "acp-kernel";
 import { protectsCodeContent } from "../operation-classifier.js";
 import type { OperationRecord, WorkflowOptions } from "../types.js";
 import { cleanDeterministic } from "./deterministic.js";
+import { guardedOperationOutput } from "../repo-bridge.js";
 
 export type PrunedToolOutput = {
     text: string;
@@ -108,6 +109,16 @@ export function pruneToolOutput(
     rawRef?: string,
 ): PrunedToolOutput {
     const rawTokens = estimateTokensFast(raw);
+    const guarded = guardedOperationOutput(operation);
+    if (guarded) {
+        return {
+            text: guarded,
+            rawTokens,
+            visibleTokens: estimateTokensFast(guarded),
+            semanticPruned: true,
+            noiseRemoved: false,
+        };
+    }
     if (protectsCodeContent(operation.type) || !options.deterministicPruner) {
         return { text: raw, rawTokens, visibleTokens: rawTokens, semanticPruned: false, noiseRemoved: false };
     }
