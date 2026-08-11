@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { ResponsesRequestBody, ResponseInputItem } from "../responses.js";
+import { responsesToCore, type ResponsesRequestBody, type ResponseInputItem } from "../responses.js";
 import type { Session } from "../session.js";
 import { archiveOperationOutput } from "./archive.js";
 import { applyDeferredRollover, checkpointRequest, workflowMemory } from "./context-gc.js";
@@ -7,7 +7,8 @@ import { operationForCall, trackOperationCall, updateOperationResult } from "./o
 import { applyPlanUpdate } from "./plan-tracker.js";
 import { pruneWithCheapModel } from "./pruner/cheap-model.js";
 import { attachRawReference, pruneToolOutput } from "./pruner/index.js";
-import { hydrateProjectMemory } from "./project-memory.js";
+import { hydrateProjectMemory, runCheapHistorian } from "./project-memory.js";
+import { syncRequirements } from "./requirements.js";
 import {
     observeRepositoryOperation,
     refreshRepoBridge,
@@ -162,7 +163,9 @@ export async function preprocessResponsesWorkflow(
         || projectIdentity(metadataProjectKey)
         || repoProjectId(state.repoBridge)
         || projectIdentity(workspace);
-    if (options.sessionGc) hydrateProjectMemory(session.id, state);
+    if (options.sessionGc) hydrateProjectMemory(session.id, state, options.memory.maxProjectSessions);
+    syncRequirements(state, responsesToCore(body).msgs, session.id);
+    if (options.sessionGc) await runCheapHistorian(session.id, state, options);
     applyDeferredRollover(state, options, session.stats.lastInputTokens || session.stats.contextTokens, modelContextLimit);
     const sourceInput = body.input.filter((item) => {
         return !((item as Record<string, unknown>).bili_workflow === true);
@@ -225,7 +228,7 @@ export async function preprocessResponsesWorkflow(
         const phaseId = state.itemPhaseByKey[itemKeys[index]];
         return !(phaseId && state.phases[phaseId]?.status === "ARCHIVED" && phaseItemCanDrop(item));
     });
-    const memory = workflowMemory(state, options.rereadAfterPhase);
+    const memory = workflowMemory(state, options.rereadAfterPhase, options.memory.maxInjectedTokens);
     if (memory) filtered.push(workflowItem(memory));
     const request = checkpointRequest(state, textProtocol);
     if (request) filtered.push(workflowItem(request));

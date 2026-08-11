@@ -13,6 +13,8 @@ test("workflow defaults are enabled and Codex-ready", () => {
     assert.equal(options.workflow?.repoBridge.enforceReread, true);
     assert.equal(options.workflow?.cachePolicy.protectCacheHitRatio, 0.65);
     assert.equal(options.workflow?.cachePolicy.expectedTokensPerStep, 8000);
+    assert.equal(options.workflow?.memory.maxInjectedTokens, 12000);
+    assert.equal(options.workflow?.historian.enabled, false);
 });
 
 test("workflow environment settings override context, pruning, archive and project identity", () => {
@@ -46,6 +48,13 @@ test("workflow environment settings override context, pruning, archive and proje
         BILI_WORKFLOW_CACHE_MAX_EXPECTED_TOKENS: "96000",
         BILI_WORKFLOW_CACHE_DEBUG_WINDOW: "14",
         BILI_WORKFLOW_CACHE_REWRITE_WEIGHT: "1.4",
+        BILI_WORKFLOW_MEMORY_MAX_INJECTED_TOKENS: "18000",
+        BILI_WORKFLOW_MEMORY_MAX_PROJECT_SESSIONS: "8",
+        BILI_WORKFLOW_HISTORIAN_ENABLED: "1",
+        BILI_WORKFLOW_HISTORIAN_MODEL: "historian-nano",
+        BILI_WORKFLOW_HISTORIAN_MAX_INPUT_TOKENS: "20000",
+        BILI_WORKFLOW_HISTORIAN_MAX_OUTPUT_TOKENS: "2500",
+        BILI_WORKFLOW_HISTORIAN_TIMEOUT_MS: "35000",
     });
     assert.deepEqual(options.workflow, {
         enabled: false,
@@ -82,6 +91,19 @@ test("workflow environment settings override context, pruning, archive and proje
             debuggingWindowOperations: 14,
             rewriteCostWeight: 1.4,
         },
+        memory: {
+            maxInjectedTokens: 18000,
+            maxProjectSessions: 8,
+        },
+        historian: {
+            enabled: true,
+            endpoint: "http://127.0.0.1:11434/v1/chat/completions",
+            model: "historian-nano",
+            apiKey: "local-key",
+            maxInputTokens: 20000,
+            maxOutputTokens: 2500,
+            timeoutMs: 35000,
+        },
     });
 });
 
@@ -92,4 +114,5 @@ test("invalid workflow ratios and token thresholds are rejected", () => {
     assert.throws(() => loadOptions({ ACP_AUTO_UPDATE: "0", BILI_WORKFLOW_CHEAP_MODEL_ENDPOINT: "file:\/\/bad" }), /endpoint protocol/);
     assert.throws(() => loadOptions({ ACP_AUTO_UPDATE: "0", BILI_WORKFLOW_CACHE_HIGH_GROWTH_RATE: "0" }), /highGrowthRate/);
     assert.throws(() => loadOptions({ ACP_AUTO_UPDATE: "0", BILI_WORKFLOW_CACHE_REWRITE_WEIGHT: "11" }), /rewriteCostWeight/);
+    assert.throws(() => loadOptions({ ACP_AUTO_UPDATE: "0", BILI_WORKFLOW_HISTORIAN_ENABLED: "1" }), /historian requires endpoint and model/);
 });

@@ -4,7 +4,7 @@ import { archiveOperationOutput } from "./archive.js";
 import { applyDeferredRollover, checkpointRequest, workflowMemory } from "./context-gc.js";
 import { attachOperationMessageRefs, operationForCall, trackOperationCall, updateOperationResult } from "./operation-tracker.js";
 import { applyPlanUpdate } from "./plan-tracker.js";
-import { hydrateProjectMemory } from "./project-memory.js";
+import { hydrateProjectMemory, runCheapHistorian } from "./project-memory.js";
 import { pruneWithCheapModel } from "./pruner/cheap-model.js";
 import { attachRawReference, pruneToolOutput } from "./pruner/index.js";
 import { syncRequirements } from "./requirements.js";
@@ -25,7 +25,9 @@ export async function preprocessCoreWorkflow(
     ]);
     refreshRepoBridge(session.workflow, workspace ?? options.repoBridge.workspaceRoot, options.repoBridge);
     session.workflow.projectId ??= options.projectKey?.trim() || repoProjectId(session.workflow.repoBridge);
-    if (options.sessionGc) hydrateProjectMemory(session.id, session.workflow);
+    if (options.sessionGc) hydrateProjectMemory(session.id, session.workflow, options.memory.maxProjectSessions);
+    syncRequirements(session.workflow, messages, session.id);
+    if (options.sessionGc) await runCheapHistorian(session.id, session.workflow, options);
     applyDeferredRollover(session.workflow, options, session.stats.lastInputTokens || session.stats.contextTokens, modelContextLimit);
     for (const message of messages) {
         if (message.contentType !== "tool-call" || !message.toolCallId) continue;
@@ -68,7 +70,7 @@ export async function preprocessCoreWorkflow(
         return operationForCall(session.workflow, message.toolCallId)?.lifecycle !== "ARCHIVED";
     });
     const tails = [
-        workflowMemory(session.workflow, options.rereadAfterPhase),
+        workflowMemory(session.workflow, options.rereadAfterPhase, options.memory.maxInjectedTokens),
         checkpointRequest(session.workflow, false),
         repositoryGuardMessage(session.workflow),
     ].filter((value): value is string => Boolean(value));
@@ -82,6 +84,5 @@ export async function preprocessCoreWorkflow(
         });
     }
     attachOperationMessageRefs(session.workflow, filtered);
-    syncRequirements(session.workflow, filtered, session.id);
     return filtered;
 }

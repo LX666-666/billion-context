@@ -1,4 +1,4 @@
-import type { PhaseRecord, WorkflowMetrics, WorkflowState } from "./types.js";
+import type { PhaseRecord, TaskRecord, WorkflowMetrics, WorkflowState } from "./types.js";
 
 export function createWorkflowMetrics(): WorkflowMetrics {
     return {
@@ -14,6 +14,9 @@ export function createWorkflowMetrics(): WorkflowMetrics {
         staleFiles: 0,
         rolloverEvaluations: 0,
         rolloverDeferrals: 0,
+        taskBoundaries: 0,
+        historianRuns: 0,
+        historianFailures: 0,
     };
 }
 
@@ -25,6 +28,7 @@ export function createInitialWorkflowState(): WorkflowState {
         nextRequirementNumber: 1,
         nextCheckpointNumber: 1,
         nextRawNumber: 1,
+        nextTaskNumber: 1,
         sessionStatus: "ACTIVE",
         seenPlanCallIds: [],
         checkpointQueue: [],
@@ -36,6 +40,8 @@ export function createInitialWorkflowState(): WorkflowState {
         phases: {},
         checkpoints: {},
         rawArchive: {},
+        tasks: {},
+        historian: { pendingTaskIds: [] },
         repoBridge: {
             nextViolationNumber: 1,
             refreshGeneration: 0,
@@ -58,7 +64,7 @@ export function createInitialWorkflowState(): WorkflowState {
 export function mergeWorkflowState(value: WorkflowState | undefined): WorkflowState {
     const fresh = createInitialWorkflowState();
     if (!value || value.version !== 1) return fresh;
-    return {
+    const merged: WorkflowState = {
         ...fresh,
         ...value,
         seenPlanCallIds: Array.isArray(value.seenPlanCallIds) ? value.seenPlanCallIds : [],
@@ -81,6 +87,19 @@ export function mergeWorkflowState(value: WorkflowState | undefined): WorkflowSt
         ])),
         checkpoints: value.checkpoints ?? {},
         rawArchive: value.rawArchive ?? {},
+        tasks: Object.fromEntries(Object.entries(value.tasks ?? {}).map(([taskId, task]) => [
+            taskId,
+            {
+                ...task,
+                requirementIds: Array.isArray(task.requirementIds) ? task.requirementIds : [],
+                phaseIds: Array.isArray(task.phaseIds) ? task.phaseIds : [],
+                checkpointIds: Array.isArray(task.checkpointIds) ? task.checkpointIds : [],
+            },
+        ])),
+        historian: {
+            ...(value.historian ?? fresh.historian),
+            pendingTaskIds: Array.isArray(value.historian?.pendingTaskIds) ? value.historian.pendingTaskIds : [],
+        },
         repoBridge: {
             ...fresh.repoBridge,
             ...(value.repoBridge ?? {}),
@@ -94,6 +113,45 @@ export function mergeWorkflowState(value: WorkflowState | undefined): WorkflowSt
         },
         metrics: { ...fresh.metrics, ...(value.metrics ?? {}) },
     };
+    return migrateTaskState(merged);
+}
+
+function migrateTaskState(state: WorkflowState): WorkflowState {
+    const existingNumbers = Object.keys(state.tasks).flatMap((taskId) => {
+        const match = /^task(\d+)$/.exec(taskId);
+        return match ? [Number(match[1])] : [];
+    });
+    state.nextTaskNumber = Math.max(state.nextTaskNumber, ...existingNumbers.map((value) => value + 1));
+    if (Object.keys(state.tasks).length > 0) return state;
+    const requirementIds = Object.keys(state.requirements);
+    const phaseIds = Object.keys(state.phases);
+    const checkpointIds = Object.keys(state.checkpoints);
+    if (requirementIds.length === 0 && phaseIds.length === 0 && checkpointIds.length === 0) return state;
+    const now = Date.now();
+    const timestamps = [
+        ...Object.values(state.requirements).map((requirement) => requirement.createdAt),
+        ...Object.values(state.phases).map((phase) => phase.startedAt),
+        ...Object.values(state.checkpoints).map((checkpoint) => checkpoint.createdAt),
+    ].filter((value) => Number.isFinite(value));
+    const taskId = `task${String(state.nextTaskNumber++).padStart(5, "0")}`;
+    const activePhase = state.activePhaseId ? state.phases[state.activePhaseId] : undefined;
+    const firstRequirement = requirementIds[0] ? state.requirements[requirementIds[0]] : undefined;
+    const task: TaskRecord = {
+        taskId,
+        objective: activePhase?.objective ?? firstRequirement?.detail ?? "Migrated workflow task",
+        status: state.sessionStatus === "COMPLETE_CANDIDATE" ? "COMPLETE_CANDIDATE" : "ACTIVE",
+        requirementIds,
+        phaseIds,
+        checkpointIds,
+        startedAt: timestamps.length > 0 ? Math.min(...timestamps) : now,
+        updatedAt: timestamps.length > 0 ? Math.max(...timestamps) : now,
+    };
+    state.tasks[taskId] = task;
+    state.activeTaskId = taskId;
+    for (const requirement of Object.values(state.requirements)) requirement.taskId = taskId;
+    for (const phase of Object.values(state.phases)) phase.taskId = taskId;
+    for (const checkpoint of Object.values(state.checkpoints)) checkpoint.taskId = taskId;
+    return state;
 }
 
 export function ensureActivePhase(state: WorkflowState, objective = "Unplanned work"): PhaseRecord {
@@ -108,9 +166,14 @@ export function ensureActivePhase(state: WorkflowState, objective = "Unplanned w
         status: "ACTIVE",
         operationIds: [],
         itemKeys: [],
+        ...(state.activeTaskId ? { taskId: state.activeTaskId } : {}),
         startedAt: Date.now(),
     };
     state.phases[phaseId] = phase;
+    if (state.activeTaskId) {
+        const task = state.tasks[state.activeTaskId];
+        if (task && !task.phaseIds.includes(phaseId)) task.phaseIds.push(phaseId);
+    }
     state.activePhaseId = phaseId;
     state.sessionStatus = "ACTIVE";
     return phase;

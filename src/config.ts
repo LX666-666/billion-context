@@ -264,6 +264,30 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
             throw new Error(`[acp-config] invalid workflow.pruner.cheapModel.endpoint protocol: ${parsedCheapEndpoint.protocol}`);
         }
     }
+    const historianEnabled = (env.BILI_WORKFLOW_HISTORIAN_ENABLED ?? (fileConfig.workflow?.historian?.enabled ? "1" : "0")) === "1";
+    const historianEndpoint = nonEmpty(env.BILI_WORKFLOW_HISTORIAN_ENDPOINT)
+        ?? nonEmpty(fileConfig.workflow?.historian?.endpoint)
+        ?? cheapModelEndpoint;
+    const historianModel = nonEmpty(env.BILI_WORKFLOW_HISTORIAN_MODEL)
+        ?? nonEmpty(fileConfig.workflow?.historian?.model)
+        ?? cheapModelName;
+    const historianApiKey = nonEmpty(env.BILI_WORKFLOW_HISTORIAN_API_KEY)
+        ?? nonEmpty(fileConfig.workflow?.historian?.apiKey)
+        ?? cheapModelApiKey;
+    if (historianEnabled && (!historianEndpoint || !historianModel)) {
+        throw new Error("[acp-config] workflow.historian requires endpoint and model when enabled");
+    }
+    if (historianEndpoint) {
+        let parsedHistorianEndpoint: URL;
+        try {
+            parsedHistorianEndpoint = new URL(historianEndpoint);
+        } catch {
+            throw new Error(`[acp-config] invalid workflow.historian.endpoint: ${JSON.stringify(historianEndpoint)}`);
+        }
+        if (parsedHistorianEndpoint.protocol !== "http:" && parsedHistorianEndpoint.protocol !== "https:") {
+            throw new Error(`[acp-config] invalid workflow.historian.endpoint protocol: ${parsedHistorianEndpoint.protocol}`);
+        }
+    }
     const workflow: WorkflowOptions = {
         enabled: (env.BILI_WORKFLOW_ENABLED ?? (fileConfig.workflow?.enabled === false ? "0" : "1")) !== "0",
         targetContextRatio: parseWorkflowRatio(
@@ -353,6 +377,39 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
                 env.BILI_WORKFLOW_CACHE_REWRITE_WEIGHT ?? fileConfig.workflow?.cache?.rewriteCostWeight,
                 "workflow.cache.rewriteCostWeight",
                 1.1,
+            ),
+        },
+        memory: {
+            maxInjectedTokens: parseWorkflowInteger(
+                env.BILI_WORKFLOW_MEMORY_MAX_INJECTED_TOKENS ?? fileConfig.workflow?.memory?.maxInjectedTokens,
+                "workflow.memory.maxInjectedTokens",
+                12_000,
+            ),
+            maxProjectSessions: parseWorkflowInteger(
+                env.BILI_WORKFLOW_MEMORY_MAX_PROJECT_SESSIONS ?? fileConfig.workflow?.memory?.maxProjectSessions,
+                "workflow.memory.maxProjectSessions",
+                6,
+            ),
+        },
+        historian: {
+            enabled: historianEnabled,
+            ...(historianEndpoint ? { endpoint: historianEndpoint } : {}),
+            ...(historianModel ? { model: historianModel } : {}),
+            ...(historianApiKey ? { apiKey: historianApiKey } : {}),
+            maxInputTokens: parseWorkflowInteger(
+                env.BILI_WORKFLOW_HISTORIAN_MAX_INPUT_TOKENS ?? fileConfig.workflow?.historian?.maxInputTokens,
+                "workflow.historian.maxInputTokens",
+                16_000,
+            ),
+            maxOutputTokens: parseWorkflowInteger(
+                env.BILI_WORKFLOW_HISTORIAN_MAX_OUTPUT_TOKENS ?? fileConfig.workflow?.historian?.maxOutputTokens,
+                "workflow.historian.maxOutputTokens",
+                2_000,
+            ),
+            timeoutMs: parseWorkflowInteger(
+                env.BILI_WORKFLOW_HISTORIAN_TIMEOUT_MS ?? fileConfig.workflow?.historian?.timeoutMs,
+                "workflow.historian.timeoutMs",
+                30_000,
             ),
         },
     };
@@ -447,6 +504,19 @@ type FileConfig = {
             maxExpectedNextWorkTokens?: number;
             debuggingWindowOperations?: number;
             rewriteCostWeight?: number;
+        };
+        memory?: {
+            maxInjectedTokens?: number;
+            maxProjectSessions?: number;
+        };
+        historian?: {
+            enabled?: boolean;
+            endpoint?: string;
+            model?: string;
+            apiKey?: string;
+            maxInputTokens?: number;
+            maxOutputTokens?: number;
+            timeoutMs?: number;
         };
     };
     mitm?: { enabled?: boolean; domains?: string[] };

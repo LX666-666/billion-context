@@ -1,5 +1,6 @@
 import { estimateTokensFast } from "acp-kernel";
 import { evaluateCachePolicy } from "./cache-policy.js";
+import { attachCheckpointToTask } from "./project-memory.js";
 import { recomputeWorkflowMetrics } from "./state.js";
 import type { OperationRecord, WorkflowCheckpoint, WorkflowOptions, WorkflowState } from "./types.js";
 
@@ -93,6 +94,7 @@ export function recordWorkflowCheckpoint(
     const checkpoint: WorkflowCheckpoint = {
         checkpointId,
         phaseId,
+        ...(phase.taskId ? { taskId: phase.taskId } : {}),
         objective: text(args.objective) ?? phase.objective,
         ...(text(args.requirementState) ? { requirementState: text(args.requirementState) } : {}),
         requirementUpdates: updates,
@@ -120,6 +122,7 @@ export function recordWorkflowCheckpoint(
     state.checkpointQueue = state.checkpointQueue.filter((queued) => queued !== phaseId);
     phase.checkpointId = checkpointId;
     phase.status = "PENDING_ROLLOVER";
+    attachCheckpointToTask(state, checkpoint);
     const keepRefs = new Set([...checkpoint.criticalRefs, ...checkpoint.keepRefs]);
     for (const opId of phase.operationIds) {
         const operation = state.operations[opId];
@@ -146,19 +149,54 @@ export function checkpointRequest(state: WorkflowState, textProtocol: boolean): 
     return `<workflow-checkpoint-request>\nPhase ${phaseId} has completed.\nObjective: ${phase.objective}\nOperations: ${operationSummary.join(", ")}\nBefore continuing, checkpoint final results, decisions and validation. Do not copy old source code or full logs. Repository state remains authoritative.\n${action}\n</workflow-checkpoint-request>`;
 }
 
-export function workflowMemory(state: WorkflowState, rereadAfterPhase: boolean): string | undefined {
-    if (state.metrics.rollovers === 0 && !state.projectHistory?.sessions.length) return undefined;
+export function workflowMemory(state: WorkflowState, rereadAfterPhase: boolean, maxTokens = 12_000): string | undefined {
+    const taskCheckpoints = Object.values(state.tasks)
+        .filter((task) => task.sessionCheckpoint)
+        .sort((a, b) => a.updatedAt - b.updatedAt);
+    if (state.metrics.rollovers === 0 && !state.projectHistory?.sessions.length && taskCheckpoints.length === 0) return undefined;
     const requirements = Object.values(state.requirements)
-        .filter((requirement) => requirement.status === "ACTIVE")
-        .map((requirement) => `${requirement.id} [${requirement.importance}] ${requirement.detail}${requirement.rawRef ? ` [raw_ref: ${requirement.rawRef}]` : ""}`);
-    const checkpoints = Object.values(state.checkpoints)
-        .sort((a, b) => a.createdAt - b.createdAt)
-        .slice(-4)
-        .map((checkpoint) => JSON.stringify(checkpoint));
-    const history = state.projectHistory?.sessions.map((session) => JSON.stringify({
-        updatedAt: session.updatedAt,
-        requirements: session.requirements,
-        checkpoint: session.checkpoint,
-    })) ?? [];
-    return `<workflow-memory>\nActive requirements:\n${requirements.join("\n")}\n\nRecent phase checkpoints:\n${checkpoints.join("\n")}\n\nPrior project sessions:\n${history.join("\n")}\n${rereadAfterPhase ? "\nFor code needed in the current phase, re-read the repository; old patch chains are not authoritative." : ""}\n</workflow-memory>`;
+        .filter((requirement) => requirement.status === "ACTIVE" && (!state.activeTaskId || !requirement.taskId || requirement.taskId === state.activeTaskId))
+        .sort((left, right) => {
+            if (left.importance !== right.importance) return left.importance === "CRITICAL" ? -1 : 1;
+            return right.createdAt - left.createdAt;
+        });
+    const prefix = `<workflow-memory>\nActive task: ${state.activeTaskId ?? "untracked"}\nActive requirements:`;
+    const reread = rereadAfterPhase
+        ? "\nFor code needed in the current phase, re-read the repository; historical memory is not authoritative for code facts."
+        : "";
+    const suffix = `${reread}\n</workflow-memory>`;
+    if (estimateTokensFast(`${prefix}${suffix}`) > maxTokens) return undefined;
+    const requirementLines: string[] = [];
+    const omittedRequirements: string[] = [];
+    for (const requirement of requirements) {
+        const line = `${requirement.id} [${requirement.importance}] ${requirement.detail}${requirement.rawRef ? ` [raw_ref: ${requirement.rawRef}]` : ""}`;
+        const candidate = `${prefix}\n${[...requirementLines, line].join("\n")}${suffix}`;
+        if (estimateTokensFast(candidate) <= maxTokens) requirementLines.push(line);
+        else omittedRequirements.push(`${requirement.id}:${requirement.rawRef ?? requirement.sourceRefs[0] ?? "unavailable"}`);
+    }
+    if (omittedRequirements.length > 0) {
+        const marker = `[${omittedRequirements.length} active requirement(s) omitted by memory budget; retrieve refs: ${omittedRequirements.join(", ")}]`;
+        const candidate = `${prefix}\n${[...requirementLines, marker].join("\n")}${suffix}`;
+        if (estimateTokensFast(candidate) <= maxTokens) requirementLines.push(marker);
+    }
+    const fixed = `${prefix}\n${requirementLines.join("\n")}`;
+    const sections: string[] = [];
+    const candidates = [
+        ...taskCheckpoints.slice(-3).reverse().map((task) => `Session checkpoint ${task.taskId}:\n${JSON.stringify(task.sessionCheckpoint)}`),
+        ...(state.projectHistory?.projectCheckpoint
+            ? [`Project checkpoint:\n${JSON.stringify(state.projectHistory.projectCheckpoint)}`]
+            : []),
+        ...(state.projectHistory?.sessions.slice(-2).reverse().map((session) => {
+            const historian = session.checkpoint.historian?.narrative;
+            return historian
+                ? `Prior task ${session.taskId ?? session.sessionKey} historian:\n${historian}`
+                : `Prior task ${session.taskId ?? session.sessionKey}:\n${JSON.stringify(session.checkpoint)}`;
+        }) ?? []),
+    ];
+    for (const candidate of candidates) {
+        const next = `${fixed}\n\n${[...sections, candidate].join("\n\n")}${suffix}`;
+        if (estimateTokensFast(next) > maxTokens) continue;
+        sections.push(candidate);
+    }
+    return `${fixed}\n\n${sections.join("\n\n")}${suffix}`;
 }

@@ -1,5 +1,6 @@
 import { ensureActivePhase } from "./state.js";
 import { markPhaseRepositoryStateStale } from "./repo-bridge.js";
+import { markActiveTaskCompleteCandidate } from "./project-memory.js";
 import type { PlanStepRecord, PlanStepStatus, WorkflowState } from "./types.js";
 
 type UpdatePlanArgs = {
@@ -67,6 +68,7 @@ export function applyPlanUpdate(state: WorkflowState, callId: string, argumentsT
     if (!currentActive && next.plan.length > 0 && next.plan.every((item) => item.status === "completed")) {
         if (previousActive && !crossedBoundary) closeActivePhase(state);
         state.sessionStatus = "COMPLETE_CANDIDATE";
+        markActiveTaskCompleteCandidate(state);
     } else {
         state.sessionStatus = "ACTIVE";
     }

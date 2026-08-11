@@ -54,6 +54,7 @@ export type RequirementRecord = {
     importance: "NORMAL" | "CRITICAL";
     preserveRaw: boolean;
     rawRef?: string;
+    taskId?: string;
     createdAt: number;
 };
 
@@ -74,6 +75,7 @@ export type PlanRecord = {
 export type WorkflowCheckpoint = {
     checkpointId: string;
     phaseId: string;
+    taskId?: string;
     objective: string;
     requirementState?: string;
     requirementUpdates: Array<{
@@ -105,6 +107,7 @@ export type PhaseRecord = {
     startedAt: number;
     completedAt?: number;
     checkpointId?: string;
+    taskId?: string;
 };
 
 export type RawArchiveIndexRecord = {
@@ -131,6 +134,9 @@ export type WorkflowMetrics = {
     staleFiles: number;
     rolloverEvaluations: number;
     rolloverDeferrals: number;
+    taskBoundaries: number;
+    historianRuns: number;
+    historianFailures: number;
 };
 
 export type CacheUsageSample = {
@@ -217,14 +223,25 @@ export type RepoBridgeState = {
     violations: RepoGuardViolation[];
 };
 
-export type ProjectHistorySession = {
-    sessionKey: string;
-    updatedAt: number;
-    requirements: Array<Pick<RequirementRecord, "id" | "detail" | "status" | "importance">>;
-    checkpoint: SessionCheckpoint;
+export type HistoricalRequirement = Pick<
+    RequirementRecord,
+    "id" | "detail" | "status" | "importance" | "sourceRefs" | "preserveRaw" | "rawRef" | "taskId"
+>;
+
+export type HistorianNarrative = {
+    model: string;
+    narrative: string;
+    sourceChecksum: string;
+    generatedAt: number;
 };
 
 export type SessionCheckpoint = {
+    level?: "SESSION" | "PROJECT";
+    taskId?: string;
+    taskStatus?: TaskRecord["status"];
+    phaseCheckpointIds?: string[];
+    requirements?: HistoricalRequirement[];
+    requirementStates?: string[];
     objectives: string[];
     completedWork: string[];
     changedFiles: string[];
@@ -236,12 +253,55 @@ export type SessionCheckpoint = {
     blockers: string[];
     unresolvedIssues: string[];
     nextActions: string[];
+    importantErrors?: string[];
+    importantCommands?: string[];
+    criticalRefs?: string[];
+    keepRefs?: string[];
+    rawRefs?: string[];
+    repository?: Pick<RepoBridgeState, "repoRoot" | "remoteIdentity" | "head" | "dirty">;
+    historian?: HistorianNarrative;
+    createdAt?: number;
+};
+
+export type ProjectCheckpoint = SessionCheckpoint & {
+    level: "PROJECT";
+    sessionKeys: string[];
+};
+
+export type ProjectHistorySession = {
+    sessionKey: string;
+    taskId?: string;
+    taskStatus?: TaskRecord["status"];
+    updatedAt: number;
+    requirements: HistoricalRequirement[];
+    checkpoint: SessionCheckpoint;
 };
 
 export type ProjectHistorySnapshot = {
     projectId: string;
     updatedAt: number;
     sessions: ProjectHistorySession[];
+    projectCheckpoint?: ProjectCheckpoint;
+};
+
+export type TaskRecord = {
+    taskId: string;
+    objective: string;
+    status: "ACTIVE" | "COMPLETE_CANDIDATE" | "COMPLETE" | "SUPERSEDED";
+    requirementIds: string[];
+    phaseIds: string[];
+    checkpointIds: string[];
+    startedAt: number;
+    updatedAt: number;
+    completedAt?: number;
+    sessionCheckpoint?: SessionCheckpoint;
+};
+
+export type HistorianState = {
+    pendingTaskIds: string[];
+    lastRunAt?: number;
+    lastModel?: string;
+    lastError?: string;
 };
 
 export type WorkflowState = {
@@ -252,7 +312,9 @@ export type WorkflowState = {
     nextRequirementNumber: number;
     nextCheckpointNumber: number;
     nextRawNumber: number;
+    nextTaskNumber: number;
     activePhaseId?: string;
+    activeTaskId?: string;
     activePlan?: PlanRecord;
     sessionStatus: "ACTIVE" | "COMPLETE_CANDIDATE";
     seenPlanCallIds: string[];
@@ -265,6 +327,8 @@ export type WorkflowState = {
     phases: Record<string, PhaseRecord>;
     checkpoints: Record<string, WorkflowCheckpoint>;
     rawArchive: Record<string, RawArchiveIndexRecord>;
+    tasks: Record<string, TaskRecord>;
+    historian: HistorianState;
     projectMemoryLoadedAt?: number;
     projectHistory?: ProjectHistorySnapshot;
     repoBridge: RepoBridgeState;
@@ -307,6 +371,19 @@ export type WorkflowOptions = {
         debuggingWindowOperations: number;
         rewriteCostWeight: number;
     };
+    memory: {
+        maxInjectedTokens: number;
+        maxProjectSessions: number;
+    };
+    historian: {
+        enabled: boolean;
+        endpoint?: string;
+        model?: string;
+        apiKey?: string;
+        maxInputTokens: number;
+        maxOutputTokens: number;
+        timeoutMs: number;
+    };
 };
 
 export const DEFAULT_WORKFLOW_OPTIONS: WorkflowOptions = {
@@ -338,5 +415,15 @@ export const DEFAULT_WORKFLOW_OPTIONS: WorkflowOptions = {
         maxExpectedNextWorkTokens: 64_000,
         debuggingWindowOperations: 10,
         rewriteCostWeight: 1.1,
+    },
+    memory: {
+        maxInjectedTokens: 12_000,
+        maxProjectSessions: 6,
+    },
+    historian: {
+        enabled: false,
+        maxInputTokens: 16_000,
+        maxOutputTokens: 2_000,
+        timeoutMs: 30_000,
     },
 };

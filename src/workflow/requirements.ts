@@ -1,5 +1,6 @@
 import type { BiliMessage } from "../bili-message.js";
 import { archiveRequirementMessage } from "./archive.js";
+import { assignRequirementToTask } from "./project-memory.js";
 import type { RequirementRecord, WorkflowState } from "./types.js";
 
 function importance(detail: string): RequirementRecord["importance"] {
@@ -25,6 +26,7 @@ export function syncRequirements(state: WorkflowState, messages: BiliMessage[], 
         };
         state.requirements[id] = requirement;
         state.requirementBySourceRef[message.id] = id;
+        assignRequirementToTask(state, requirement, sessionId);
         if (sessionId && requirement.preserveRaw) archiveRequirementMessage(sessionId, state, requirement, message.text);
         created.push(requirement);
     }

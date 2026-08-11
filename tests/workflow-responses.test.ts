@@ -77,7 +77,7 @@ test("Responses workflow prunes before ingest, archives raw output, checkpoints 
     const pruned = (first.body.input as ResponseInputItem[]).find((item) => item.type === "function_call_output" && item.call_id === "test-1");
     assert.ok(pruned && "output" in pruned);
     assert.match(String(pruned.output), /\[TEST PASS\]/);
-    assert.match(String(pruned.output), /raw_ref: raw_000001/);
+    assert.match(String(pruned.output), /raw_ref: raw_\d{6}/);
     const originalOutput = initialInput.find((item) => item.type === "function_call_output" && item.call_id === "test-1");
     assert.equal((originalOutput as { output: string }).output, rawLog);
     const testOperation = Object.values(session.workflow.operations).find((operation) => operation.toolCallId === "test-1");
@@ -91,7 +91,7 @@ test("Responses workflow prunes before ingest, archives raw output, checkpoints 
         { type: "function_call_output", call_id: "plan-2", output: "Plan updated" } as ResponseInputItem,
     ];
     const second = await preprocessResponsesWorkflow({ model: "gpt-5-codex", input: completedInput }, session, options, 400_000, true);
-    assert.equal(Object.keys(session.workflow.rawArchive).length, 1);
+    assert.equal(Object.values(session.workflow.rawArchive).filter((record) => record.type === "TEST").length, 1);
     assert.equal(session.workflow.checkpointQueue.length, 1);
     assert.match(JSON.stringify(second.body.input), /workflow-checkpoint-request/);
     session.workflow.requirements["REQ-00001"] = {
