@@ -1,5 +1,5 @@
 import type { OperationRecord } from "../types.js";
-import { crashSignal, diagnosticLines, duration, environmentLines, exitCode, outputExcerpt, outputFailed } from "./diagnostics.js";
+import { crashSignal, diagnosticLines, duration, environmentLines, exitCode, outputExcerpt, outputFailed, validationOutcome } from "./diagnostics.js";
 
 function reference(rawRef: string | undefined): string[] {
     return rawRef ? ["", `raw_ref: ${rawRef}`] : [];
@@ -9,13 +9,13 @@ export function summarizeRun(text: string, operation: OperationRecord, rawRef: s
     const code = exitCode(text);
     const signal = crashSignal(text);
     const failed = outputFailed(text, code) || Boolean(signal);
-    const passed = !failed && code === "0";
+    const outcome = validationOutcome(text, "RUN");
     const elapsed = duration(text);
     const diagnostics = diagnosticLines(text);
     const environment = environmentLines(text);
     const excerpt = outputExcerpt(text);
     return [
-        failed ? "[RUN FAILED]" : passed ? "[RUN PASS]" : "[RUN OUTPUT PRUNED]",
+        failed ? "[RUN FAILED]" : outcome === "PASS" ? "[RUN PASS]" : outcome === "UNKNOWN" ? "[RUN UNKNOWN]\n[RUN OUTPUT PRUNED]" : "[RUN OUTPUT PRUNED]",
         `op_id: ${operation.opId}`,
         operation.command ? `command: ${operation.command}` : undefined,
         operation.workdir ? `workdir: ${operation.workdir}` : undefined,

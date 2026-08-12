@@ -17,6 +17,8 @@ export const ACP_DECOMPRESS_OPEN = "\x3cacp_decompress\x3e";
 export const ACP_DECOMPRESS_CLOSE = "\x3c/acp_decompress\x3e";
 export const WORKFLOW_TEXT_OPEN = "\x3cworkflow_checkpoint\x3e";
 export const WORKFLOW_TEXT_CLOSE = "\x3c/workflow_checkpoint\x3e";
+export const WORKFLOW_MARK_TEXT_OPEN = "\x3cworkflow_mark\x3e";
+export const WORKFLOW_MARK_TEXT_CLOSE = "\x3c/workflow_mark\x3e";
 export const RETRIEVE_RAW_TEXT_OPEN = "\x3cretrieve_raw\x3e";
 export const RETRIEVE_RAW_TEXT_CLOSE = "\x3c/retrieve_raw\x3e";
 export const EXPAND_OPERATION_TEXT_OPEN = "\x3cexpand_operation\x3e";
@@ -260,6 +262,7 @@ export const ACP_STATUS_TOOL_OPENAI = {
 
 export const RETRIEVE_RAW_TOOL_NAME = "retrieve_raw";
 export const EXPAND_OPERATION_TOOL_NAME = "expand_operation";
+export const WORKFLOW_MARK_TOOL_NAME = "workflow_mark";
 
 const RETRIEVE_RAW_PARAMETERS = {
     type: "object",
@@ -271,6 +274,25 @@ const EXPAND_OPERATION_PARAMETERS = {
     type: "object",
     properties: { opId: { type: "string" } },
     required: ["opId"],
+};
+
+
+const WORKFLOW_MARK_PARAMETERS = {
+    type: "object",
+    properties: {
+        operations: {
+            type: "array",
+            items: {
+                type: "object",
+                properties: {
+                    opId: { type: "string" },
+                    state: { type: "string", enum: ["CONSUMED", "KEEP", "CRITICAL"] },
+                },
+                required: ["opId", "state"],
+            },
+        },
+    },
+    required: ["operations"],
 };
 
 export const RETRIEVE_RAW_TOOL_OPENAI = {
@@ -291,6 +313,46 @@ export const EXPAND_OPERATION_TOOL_OPENAI = {
     },
 };
 
+
+export const WORKFLOW_MARK_TOOL_OPENAI = {
+    type: "function" as const,
+    function: {
+        name: WORKFLOW_MARK_TOOL_NAME,
+        description: "Mark delivered workflow operations as consumed, keep, or critical. Never archive directly.",
+        parameters: WORKFLOW_MARK_PARAMETERS,
+    },
+};
+
+const WORKFLOW_CHECKPOINT_PARAMETERS_OPENAI = {
+    type: "object",
+    properties: {
+        phaseId: { type: "string" },
+        objective: { type: "string" },
+        requirementUpdates: { type: "array" },
+        completedWork: { type: "string" },
+        changedFiles: { type: "array", items: { type: "string" } },
+        currentState: { type: "string" },
+        decisions: { type: "array" },
+        rejectedApproaches: { type: "array", items: { type: "string" } },
+        failedAttempts: { type: "array", items: { type: "string" } },
+        validation: { type: "array", items: { type: "string" } },
+        blockers: { type: "array", items: { type: "string" } },
+        unresolvedIssues: { type: "array", items: { type: "string" } },
+        criticalRefs: { type: "array", items: { type: "string" } },
+        keepRefs: { type: "array", items: { type: "string" } },
+    },
+    required: ["phaseId", "completedWork", "currentState"],
+};
+
+export const WORKFLOW_CHECKPOINT_TOOL_OPENAI = {
+    type: "function" as const,
+    function: {
+        name: "workflow_checkpoint",
+        description: "Record a completed coding phase after evidence validation.",
+        parameters: WORKFLOW_CHECKPOINT_PARAMETERS_OPENAI,
+    },
+};
+
 export const ACP_COMPRESSION_TOOLS_OPENAI = [
     COMPRESS_TOOL_OPENAI,
     DECOMPRESS_TOOL_OPENAI,
@@ -299,6 +361,8 @@ export const ACP_COMPRESSION_TOOLS_OPENAI = [
 ] as const;
 
 export const ACP_WORKFLOW_TOOLS_OPENAI = [
+    WORKFLOW_CHECKPOINT_TOOL_OPENAI,
+    WORKFLOW_MARK_TOOL_OPENAI,
     RETRIEVE_RAW_TOOL_OPENAI,
     EXPAND_OPERATION_TOOL_OPENAI,
 ] as const;
@@ -339,6 +403,19 @@ export const EXPAND_OPERATION_TOOL = {
     input_schema: EXPAND_OPERATION_PARAMETERS,
 };
 
+
+export const WORKFLOW_MARK_TOOL = {
+    name: WORKFLOW_MARK_TOOL_NAME,
+    description: WORKFLOW_MARK_TOOL_OPENAI.function.description,
+    input_schema: WORKFLOW_MARK_PARAMETERS,
+};
+
+export const WORKFLOW_CHECKPOINT_TOOL = {
+    name: "workflow_checkpoint",
+    description: WORKFLOW_CHECKPOINT_TOOL_OPENAI.function.description,
+    input_schema: WORKFLOW_CHECKPOINT_PARAMETERS_OPENAI,
+};
+
 export const ACP_COMPRESSION_TOOLS_ANTHROPIC = [
     COMPRESS_TOOL,
     DECOMPRESS_TOOL,
@@ -347,6 +424,8 @@ export const ACP_COMPRESSION_TOOLS_ANTHROPIC = [
 ] as const;
 
 export const ACP_WORKFLOW_TOOLS_ANTHROPIC = [
+    WORKFLOW_CHECKPOINT_TOOL,
+    WORKFLOW_MARK_TOOL,
     RETRIEVE_RAW_TOOL,
     EXPAND_OPERATION_TOOL,
 ] as const;
@@ -401,7 +480,7 @@ export const WORKFLOW_CHECKPOINT_TOOL_RESPONSES = {
                     type: "object",
                     properties: {
                         id: { type: "string" },
-                        status: { type: "string", enum: ["ACTIVE", "SATISFIED", "SUPERSEDED", "CANCELLED"] },
+                        status: { type: "string", enum: ["ACTIVE", "ACTIVE_CURRENT", "ACTIVE_STABLE", "SATISFIED", "SUPERSEDED", "CANCELLED", "HISTORICAL"] },
                         supersededBy: { type: "string" },
                     },
                     required: ["id", "status"],
@@ -435,6 +514,13 @@ export const WORKFLOW_CHECKPOINT_TOOL_RESPONSES = {
     },
 };
 
+export const WORKFLOW_MARK_TOOL_RESPONSES = {
+    type: "function" as const,
+    name: WORKFLOW_MARK_TOOL_NAME,
+    description: WORKFLOW_MARK_TOOL_OPENAI.function.description,
+    parameters: WORKFLOW_MARK_PARAMETERS,
+};
+
 export const RETRIEVE_RAW_TOOL_RESPONSES = {
     type: "function" as const,
     name: RETRIEVE_RAW_TOOL_NAME,
@@ -449,6 +535,7 @@ export const EXPAND_OPERATION_TOOL_RESPONSES = {
     parameters: EXPAND_OPERATION_PARAMETERS,
 };
 
+
 /** Compression tools in Responses API flat format. */
 export const ACP_CONTEXT_TOOLS_RESPONSES = [
     COMPRESS_TOOL_RESPONSES,
@@ -459,6 +546,7 @@ export const ACP_CONTEXT_TOOLS_RESPONSES = [
 
 export const WORKFLOW_TOOLS_RESPONSES = [
     WORKFLOW_CHECKPOINT_TOOL_RESPONSES,
+    WORKFLOW_MARK_TOOL_RESPONSES,
     RETRIEVE_RAW_TOOL_RESPONSES,
     EXPAND_OPERATION_TOOL_RESPONSES,
 ] as const;
@@ -476,6 +564,7 @@ export const PROXY_TOOL_NAMES: ReadonlySet<string> = new Set([
     RETRIEVE_RAW_TOOL_NAME,
     EXPAND_OPERATION_TOOL_NAME,
     "workflow_checkpoint",
+    WORKFLOW_MARK_TOOL_NAME,
 ]);
 
 export const RESPONSES_PROXY_TOOL_NAMES: ReadonlySet<string> = new Set([
@@ -488,6 +577,7 @@ export const MUTATING_PROXY_TOOLS: ReadonlySet<string> = new Set([
     COMPRESS_TOOL_NAME,
     DECOMPRESS_TOOL_NAME,
     "workflow_checkpoint",
+    WORKFLOW_MARK_TOOL_NAME,
     RETRIEVE_RAW_TOOL_NAME,
     EXPAND_OPERATION_TOOL_NAME,
 ]);

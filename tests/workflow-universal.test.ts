@@ -27,7 +27,7 @@ function session(): Session {
     };
 }
 
-test("generic Anthropic/OpenAI core path prunes large test output before the kernel", async () => {
+test("generic Anthropic/OpenAI core path fails open when raw semantic archive is disabled", async () => {
     const current = session();
     const raw = ["Exit code: 0", ...Array.from({ length: 800 }, (_, index) => `runner ${index}`), "pass 50", "fail 0"].join("\n");
     const messages: BiliMessage[] = [
@@ -35,8 +35,8 @@ test("generic Anthropic/OpenAI core path prunes large test output before the ker
         { id: "m2", role: "tool", contentType: "tool-result", toolCallId: "call-test", text: raw },
     ];
     const output = await preprocessCoreWorkflow(messages, current, { ...DEFAULT_WORKFLOW_OPTIONS, prunerMinTokens: 10, archiveSemanticRaw: false });
-    assert.match(output[1].text ?? "", /\[TEST PASS\]/);
-    assert.ok((output[1].text?.length ?? 0) < raw.length / 5);
+    assert.doesNotMatch(output[1].text ?? "", /\[TEST PASS\]/);
+    assert.equal(output[1].text, raw);
     assert.equal(Object.values(current.workflow.operations)[0].type, "TEST");
 });
 

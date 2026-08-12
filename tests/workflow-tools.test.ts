@@ -16,8 +16,8 @@ import type { ResponsesRequestBody, ResponseInputItem } from "../src/responses.t
 
 test("Responses tool groups keep compression and workflow injection independently selectable", () => {
     assert.deepEqual(ACP_CONTEXT_TOOLS_RESPONSES.map((tool) => tool.name), ["compress", "decompress", "search_context", "acp_status"]);
-    assert.deepEqual(WORKFLOW_TOOLS_RESPONSES.map((tool) => tool.name), ["workflow_checkpoint", "retrieve_raw", "expand_operation"]);
-    assert.equal(ACP_TOOLS_RESPONSES.length, 7);
+    assert.deepEqual(WORKFLOW_TOOLS_RESPONSES.map((tool) => tool.name), ["workflow_checkpoint", "workflow_mark", "retrieve_raw", "expand_operation"]);
+    assert.equal(ACP_TOOLS_RESPONSES.length, 8);
 });
 
 test("Codex text protocol extracts checkpoint and retrieval markers without exposing them", () => {
@@ -60,7 +60,7 @@ test("Codex checkpoint refreshes the same internal sampling request after phase 
             role: "assistant",
             content: [{
                 type: "output_text",
-                text: `<workflow_checkpoint>{"phaseId":"${phase.phaseId}","completedWork":"Implemented pruning","currentState":"Tests pass"}</workflow_checkpoint>`,
+                text: `<workflow_checkpoint>{"phaseId":"${phase.phaseId}","completedWork":"Implemented pruning","currentState":"Tests pass","validation":["npm test PASS op00001"]}</workflow_checkpoint>`,
             }],
         }],
     };
@@ -68,7 +68,7 @@ test("Codex checkpoint refreshes the same internal sampling request after phase 
         model: "gpt-5-codex",
         input: [
             { type: "function_call", call_id: "work-call", name: "shell_command", arguments: JSON.stringify({ command: "npm test" }) },
-            { type: "function_call_output", call_id: "work-call", output: "test output" },
+            { type: "function_call_output", call_id: "work-call", output: "Exit code: 0\npass 1\nfail 0" },
             { type: "message", role: "assistant", content: "Internal phase reasoning" },
         ],
     };

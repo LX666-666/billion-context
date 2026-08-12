@@ -273,6 +273,17 @@ function patchOriginalItem(original: ResponseInputItem, source: CoreMessage, nex
     if (original.type === "function_call_output") {
         return { ...original, call_id: next.toolCallId ?? String(original.call_id ?? ""), output: next.text ?? "" };
     }
+    if (original.type === "custom_tool_call") {
+        return {
+            ...original,
+            name: next.toolName ?? String(original.name ?? "unknown"),
+            call_id: next.toolCallId ?? String(original.call_id ?? ""),
+            input: next.text ?? "",
+        };
+    }
+    if (original.type === "custom_tool_call_output") {
+        return { ...original, call_id: next.toolCallId ?? String(original.call_id ?? ""), output: next.text ?? "" };
+    }
     return original;
 }
 

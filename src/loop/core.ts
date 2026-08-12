@@ -19,6 +19,7 @@ import { proxyDispatcher } from "../upstream-proxy.js";
 import { log as loggerLog } from "../logger.js";
 import { expandOperation, retrieveRawOutput } from "../workflow/archive.js";
 import { recordWorkflowCheckpoint } from "../workflow/context-gc.js";
+import { markWorkflowOperations } from "../workflow/operation-tracker.js";
 import { saveProjectMemory } from "../workflow/project-memory.js";
 import { DEFAULT_WORKFLOW_OPTIONS, type WorkflowOptions } from "../workflow/types.js";
 import { recordWorkflowUsage } from "../workflow/cache-policy.js";
@@ -121,10 +122,16 @@ export function executeProxyTool(
             options,
             ctx.session.stats.lastInputTokens || ctx.session.stats.contextTokens,
             ctx.config.modelContextLimit,
+            ctx.session.id,
         );
         if (result.includes("workflow_checkpoint OK") && options.sessionGc) {
             saveProjectMemory(ctx.session.id, ctx.session.workflow);
         }
+        markDirty(ctx.session);
+        return result;
+    }
+    if (toolName === "workflow_mark") {
+        const result = markWorkflowOperations(ctx.session.workflow, args);
         markDirty(ctx.session);
         return result;
     }
@@ -337,10 +344,11 @@ export async function* runCompressLoop(
             ctx.log(`[acp-loop] round ${round} saw mutating proxy tool; re-requesting`);
 
             let newBody = adapter.buildRequest(coreMessages, systemPrompt, requestBody);
-            const checkpointRecorded = proxyResults.some((result) =>
-                result.name === "workflow_checkpoint" && result.result.includes("workflow_checkpoint OK"),
+            const workflowStateChanged = proxyResults.some((result) =>
+                (result.name === "workflow_checkpoint" && result.result.includes("workflow_checkpoint OK"))
+                || result.name === "workflow_mark",
             );
-            if (checkpointRecorded && ctx.refreshWorkflowRequest) {
+            if (workflowStateChanged && ctx.refreshWorkflowRequest) {
                 const refreshed = await ctx.refreshWorkflowRequest(newBody);
                 newBody = refreshed.requestBody;
                 requestBody = refreshed.requestBody;

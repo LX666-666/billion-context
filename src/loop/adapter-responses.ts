@@ -12,6 +12,8 @@ import {
     ACP_DECOMPRESS_CLOSE,
     WORKFLOW_TEXT_OPEN,
     WORKFLOW_TEXT_CLOSE,
+    WORKFLOW_MARK_TEXT_OPEN,
+    WORKFLOW_MARK_TEXT_CLOSE,
     RETRIEVE_RAW_TEXT_OPEN,
     RETRIEVE_RAW_TEXT_CLOSE,
     EXPAND_OPERATION_TEXT_OPEN,
@@ -363,6 +365,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 { name: "search_context", open: ACP_SEARCH_OPEN, close: ACP_SEARCH_CLOSE, requirePayload: true },
                 { name: "decompress", open: ACP_DECOMPRESS_OPEN, close: ACP_DECOMPRESS_CLOSE, requirePayload: true },
                 { name: "workflow_checkpoint", open: WORKFLOW_TEXT_OPEN, close: WORKFLOW_TEXT_CLOSE, requirePayload: true },
+                { name: "workflow_mark", open: WORKFLOW_MARK_TEXT_OPEN, close: WORKFLOW_MARK_TEXT_CLOSE, requirePayload: true },
                 { name: "retrieve_raw", open: RETRIEVE_RAW_TEXT_OPEN, close: RETRIEVE_RAW_TEXT_CLOSE, requirePayload: true },
                 { name: "expand_operation", open: EXPAND_OPERATION_TEXT_OPEN, close: EXPAND_OPERATION_TEXT_CLOSE, requirePayload: true },
             ];

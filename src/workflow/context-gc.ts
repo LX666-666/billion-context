@@ -1,7 +1,10 @@
 import { estimateTokensFast } from "acp-kernel";
+import { archivePhase, verifyArchiveCommit } from "./archive.js";
 import { evaluateCachePolicy } from "./cache-policy.js";
+import { validateCheckpointAgainstPhase } from "./checkpoint-validator.js";
 import { attachCheckpointToTask } from "./project-memory.js";
-import { recomputeWorkflowMetrics } from "./state.js";
+import { archiveHistoricalRequirements, refreshRequirementHistory } from "./requirements.js";
+import { markPhaseMessagesPendingDrop, recomputeWorkflowMetrics } from "./state.js";
 import type { OperationRecord, WorkflowCheckpoint, WorkflowOptions, WorkflowState } from "./types.js";
 
 function strings(value: unknown): string[] {
@@ -31,26 +34,47 @@ function requirementUpdates(value: unknown): WorkflowCheckpoint["requirementUpda
         const record = item as Record<string, unknown>;
         const id = text(record.id);
         const status = record.status;
-        if (!id || (status !== "ACTIVE" && status !== "SATISFIED" && status !== "SUPERSEDED" && status !== "CANCELLED")) return [];
+        if (!id || (
+            status !== "ACTIVE"
+            && status !== "ACTIVE_CURRENT"
+            && status !== "ACTIVE_STABLE"
+            && status !== "SATISFIED"
+            && status !== "SUPERSEDED"
+            && status !== "CANCELLED"
+            && status !== "HISTORICAL"
+        )) return [];
         return [{ id, status, ...(text(record.supersededBy) ? { supersededBy: text(record.supersededBy) } : {}) }];
     });
 }
 
 function operationIsKept(operation: OperationRecord, keepRefs: Set<string>): boolean {
+    if (operation.lifecycle === "KEEP" || operation.lifecycle === "CRITICAL") return true;
     if (operation.importance === "CRITICAL") return true;
     if (keepRefs.has(operation.opId)) return true;
     return [...operation.callRefs, ...operation.resultRefs].some((ref) => keepRefs.has(ref));
 }
 
-function archivePendingPhase(state: WorkflowState, phaseId: string): void {
+function archivePendingPhase(state: WorkflowState, phaseId: string): boolean {
     const phase = state.phases[phaseId];
-    if (!phase || phase.status !== "PENDING_ROLLOVER") return;
+    if (!phase || phase.status !== "PENDING_ROLLOVER") return false;
+    if (phase.archiveStatus !== "COMMITTED" || !phase.archiveChecksum) return false;
+    const archiveSessionId = state.archiveSessionId ?? "workflow-state";
+    if (!verifyArchiveCommit(archiveSessionId, phaseId, phase.archiveChecksum, state)) {
+        phase.archiveStatus = "FAILED";
+        phase.archiveError = "phase archive commit is missing or failed verification";
+        return false;
+    }
     for (const opId of phase.operationIds) {
         const operation = state.operations[opId];
         if (operation?.lifecycle === "PENDING_DROP") operation.lifecycle = "ARCHIVED";
     }
+    for (const message of Object.values(state.phaseMessages)) {
+        if (message.phaseId === phaseId && message.lifecycle === "PENDING_DROP") message.lifecycle = "ARCHIVED";
+    }
+    archiveHistoricalRequirements(state);
     phase.status = "ARCHIVED";
     state.metrics.rollovers++;
+    return true;
 }
 
 export function applyDeferredRollover(
@@ -58,14 +82,22 @@ export function applyDeferredRollover(
     options: WorkflowOptions,
     contextTokens: number,
     modelContextLimit: number,
+    model?: string,
 ): boolean {
     recomputeWorkflowMetrics(state);
-    const decision = evaluateCachePolicy(state, options, contextTokens, modelContextLimit);
+    const decision = evaluateCachePolicy(state, options, contextTokens, modelContextLimit, model);
     if (decision.action !== "ROLLOVER") return false;
     const pending = Object.values(state.phases).filter((phase) => phase.status === "PENDING_ROLLOVER");
-    for (const phase of pending) archivePendingPhase(state, phase.phaseId);
+    const archiveSessionId = state.archiveSessionId ?? "workflow-state";
+    if (pending.some((phase) =>
+        phase.archiveStatus !== "COMMITTED"
+        || !phase.archiveChecksum
+        || !verifyArchiveCommit(archiveSessionId, phase.phaseId, phase.archiveChecksum, state),
+    )) return false;
+    let archived = false;
+    for (const phase of pending) archived = archivePendingPhase(state, phase.phaseId) || archived;
     recomputeWorkflowMetrics(state);
-    return pending.length > 0;
+    return archived;
 }
 
 export function recordWorkflowCheckpoint(
@@ -74,6 +106,8 @@ export function recordWorkflowCheckpoint(
     options: WorkflowOptions,
     contextTokens: number,
     modelContextLimit: number,
+    sessionId?: string,
+    model?: string,
 ): string {
     const requestedPhase = text(args.phaseId);
     const phaseId = requestedPhase && state.checkpointQueue.includes(requestedPhase)
@@ -89,7 +123,7 @@ export function recordWorkflowCheckpoint(
     if (!completedWork || !currentState) {
         return "[workflow_checkpoint FAILED: completedWork and currentState are required]";
     }
-    const checkpointId = `checkpoint${String(state.nextCheckpointNumber++).padStart(5, "0")}`;
+    const checkpointId = `checkpoint${String(state.nextCheckpointNumber).padStart(5, "0")}`;
     const updates = requirementUpdates(args.requirementUpdates);
     const checkpoint: WorkflowCheckpoint = {
         checkpointId,
@@ -112,6 +146,53 @@ export function recordWorkflowCheckpoint(
         keepRefs: strings(args.keepRefs),
         createdAt: Date.now(),
     };
+    const phaseOperations = phase.operationIds
+        .map((opId) => state.operations[opId])
+        .filter((operation): operation is OperationRecord => Boolean(operation));
+    const activeOperations = phaseOperations.filter((operation) => operation.lifecycle === "ACTIVE");
+    if (activeOperations.length > 0) {
+        state.metrics.checkpointRejects++;
+        state.metrics.checkpointRetries++;
+        return `[workflow_checkpoint REJECTED: undelivered operation(s): ${activeOperations.map((operation) => operation.opId).join(", ")}]`;
+    }
+    const validation = validateCheckpointAgainstPhase(checkpoint, phase, phaseOperations, state);
+    if (!validation.valid) {
+        state.metrics.checkpointRejects++;
+        state.metrics.checkpointRetries++;
+        return `[workflow_checkpoint REJECTED: ${validation.errors.join("; ")}]`;
+    }
+    const previousOperationLifecycles = new Map(
+        phaseOperations.map((operation) => [operation.opId, operation.lifecycle] as const),
+    );
+    const previousMessageLifecycles = new Map(
+        Object.values(state.phaseMessages)
+            .filter((message) => message.phaseId === phaseId)
+            .map((message) => [message.messageRef, message.lifecycle] as const),
+    );
+    const keepRefs = new Set([...checkpoint.criticalRefs, ...checkpoint.keepRefs]);
+    for (const opId of phase.operationIds) {
+        const operation = state.operations[opId];
+        if (!operation) continue;
+        if (operation.lifecycle === "DELIVERED") operation.lifecycle = "CONSUMED";
+        if (operation.importance === "CRITICAL" && operation.lifecycle === "CONSUMED") operation.lifecycle = "CRITICAL";
+        if (!operationIsKept(operation, keepRefs) && operation.lifecycle === "CONSUMED") operation.lifecycle = "PENDING_DROP";
+    }
+    markPhaseMessagesPendingDrop(state, phaseId, keepRefs);
+    const archive = archivePhase(sessionId, state, phaseId, checkpoint);
+    if (!archive.committed) {
+        for (const operation of phaseOperations) {
+            const lifecycle = previousOperationLifecycles.get(operation.opId);
+            if (lifecycle) operation.lifecycle = lifecycle;
+        }
+        for (const message of Object.values(state.phaseMessages)) {
+            const lifecycle = previousMessageLifecycles.get(message.messageRef);
+            if (lifecycle) message.lifecycle = lifecycle;
+        }
+        recomputeWorkflowMetrics(state);
+        state.metrics.checkpointRejects++;
+        return `[workflow_checkpoint REJECTED: phase archive failed — ${archive.error ?? "unknown archive error"}]`;
+    }
+    state.nextCheckpointNumber++;
     state.checkpoints[checkpointId] = checkpoint;
     for (const update of updates) {
         const requirement = state.requirements[update.id];
@@ -123,14 +204,11 @@ export function recordWorkflowCheckpoint(
     phase.checkpointId = checkpointId;
     phase.status = "PENDING_ROLLOVER";
     attachCheckpointToTask(state, checkpoint);
-    const keepRefs = new Set([...checkpoint.criticalRefs, ...checkpoint.keepRefs]);
-    for (const opId of phase.operationIds) {
-        const operation = state.operations[opId];
-        if (operation && !operationIsKept(operation, keepRefs)) operation.lifecycle = "PENDING_DROP";
-    }
+    refreshRequirementHistory(state);
+    markPhaseMessagesPendingDrop(state, phaseId, keepRefs);
     state.metrics.checkpointTokens += estimateTokensFast(JSON.stringify(checkpoint));
     recomputeWorkflowMetrics(state);
-    applyDeferredRollover(state, options, contextTokens, modelContextLimit);
+    applyDeferredRollover(state, options, contextTokens, modelContextLimit, model);
     return `[workflow_checkpoint OK: ${checkpointId} recorded for ${phaseId}]`;
 }
 
@@ -155,7 +233,10 @@ export function workflowMemory(state: WorkflowState, rereadAfterPhase: boolean, 
         .sort((a, b) => a.updatedAt - b.updatedAt);
     if (state.metrics.rollovers === 0 && !state.projectHistory?.sessions.length && taskCheckpoints.length === 0) return undefined;
     const requirements = Object.values(state.requirements)
-        .filter((requirement) => requirement.status === "ACTIVE" && (!state.activeTaskId || !requirement.taskId || requirement.taskId === state.activeTaskId))
+        .filter((requirement) =>
+            (requirement.status === "ACTIVE" || requirement.status === "ACTIVE_CURRENT" || requirement.status === "ACTIVE_STABLE")
+            && (!state.activeTaskId || !requirement.taskId || requirement.taskId === state.activeTaskId),
+        )
         .sort((left, right) => {
             if (left.importance !== right.importance) return left.importance === "CRITICAL" ? -1 : 1;
             return right.createdAt - left.createdAt;

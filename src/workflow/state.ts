@@ -1,4 +1,12 @@
-import type { PhaseRecord, TaskRecord, WorkflowMetrics, WorkflowState } from "./types.js";
+import { estimateTokensFast } from "acp-kernel";
+import type {
+    PhaseMessageRecord,
+    PhaseRecord,
+    RequirementMessageRecord,
+    TaskRecord,
+    WorkflowMetrics,
+    WorkflowState,
+} from "./types.js";
 
 export function createWorkflowMetrics(): WorkflowMetrics {
     return {
@@ -6,6 +14,10 @@ export function createWorkflowMetrics(): WorkflowMetrics {
         visibleToolTokens: 0,
         preIngestSavedTokens: 0,
         pendingDropTokens: 0,
+        pendingDropOperationTokens: 0,
+        pendingDropMessageTokens: 0,
+        pendingDropRequirementTokens: 0,
+        pendingDropTotalTokens: 0,
         rollovers: 0,
         checkpointTokens: 0,
         rawRetrievals: 0,
@@ -17,6 +29,8 @@ export function createWorkflowMetrics(): WorkflowMetrics {
         taskBoundaries: 0,
         historianRuns: 0,
         historianFailures: 0,
+        checkpointRejects: 0,
+        checkpointRetries: 0,
     };
 }
 
@@ -28,6 +42,8 @@ export function createInitialWorkflowState(): WorkflowState {
         nextRequirementNumber: 1,
         nextCheckpointNumber: 1,
         nextRawNumber: 1,
+        nextRequirementMessageNumber: 1,
+        nextPlanItemNumber: 1,
         nextTaskNumber: 1,
         sessionStatus: "ACTIVE",
         seenPlanCallIds: [],
@@ -36,10 +52,12 @@ export function createInitialWorkflowState(): WorkflowState {
         operationByCallId: {},
         itemPhaseByKey: {},
         requirements: {},
+        requirementMessages: {},
         requirementBySourceRef: {},
         phases: {},
         checkpoints: {},
         rawArchive: {},
+        phaseMessages: {},
         tasks: {},
         historian: { pendingTaskIds: [] },
         repoBridge: {
@@ -67,6 +85,8 @@ export function mergeWorkflowState(value: WorkflowState | undefined): WorkflowSt
     const merged: WorkflowState = {
         ...fresh,
         ...value,
+        nextRequirementMessageNumber: value.nextRequirementMessageNumber ?? fresh.nextRequirementMessageNumber,
+        nextPlanItemNumber: value.nextPlanItemNumber ?? fresh.nextPlanItemNumber,
         seenPlanCallIds: Array.isArray(value.seenPlanCallIds) ? value.seenPlanCallIds : [],
         checkpointQueue: Array.isArray(value.checkpointQueue) ? value.checkpointQueue : [],
         operations: Object.fromEntries(Object.entries(value.operations ?? {}).map(([opId, operation]) => [
@@ -80,6 +100,7 @@ export function mergeWorkflowState(value: WorkflowState | undefined): WorkflowSt
         operationByCallId: value.operationByCallId ?? {},
         itemPhaseByKey: value.itemPhaseByKey ?? {},
         requirements: value.requirements ?? {},
+        requirementMessages: value.requirementMessages ?? {},
         requirementBySourceRef: value.requirementBySourceRef ?? {},
         phases: Object.fromEntries(Object.entries(value.phases ?? {}).map(([phaseId, phase]) => [
             phaseId,
@@ -87,6 +108,7 @@ export function mergeWorkflowState(value: WorkflowState | undefined): WorkflowSt
         ])),
         checkpoints: value.checkpoints ?? {},
         rawArchive: value.rawArchive ?? {},
+        phaseMessages: value.phaseMessages ?? {},
         tasks: Object.fromEntries(Object.entries(value.tasks ?? {}).map(([taskId, task]) => [
             taskId,
             {
@@ -175,21 +197,115 @@ export function ensureActivePhase(state: WorkflowState, objective = "Unplanned w
         if (task && !task.phaseIds.includes(phaseId)) task.phaseIds.push(phaseId);
     }
     state.activePhaseId = phaseId;
+    state.phaseBoundaryCandidate = undefined;
     state.sessionStatus = "ACTIVE";
     return phase;
+}
+
+export type CapturePhaseMessageInput = {
+    phaseId: string;
+    messageRef: string;
+    role: string;
+    contentType: string;
+    payload?: string;
+    tokenSize?: number;
+    operationId?: string;
+    requirementMessageId?: string;
+};
+
+export function capturePhaseMessage(state: WorkflowState, input: CapturePhaseMessageInput): PhaseMessageRecord {
+    const now = Date.now();
+    const existing = state.phaseMessages[input.messageRef];
+    const tokenSize = input.tokenSize ?? (input.payload ? estimateTokensFast(input.payload) : 0);
+    if (existing) {
+        if (existing.lifecycle !== "ARCHIVED" && input.payload !== undefined) existing.payload = input.payload;
+        existing.tokenSize = Math.max(existing.tokenSize, tokenSize);
+        existing.role = input.role;
+        existing.contentType = input.contentType;
+        if (input.operationId) existing.operationId = input.operationId;
+        if (input.requirementMessageId) existing.requirementMessageId = input.requirementMessageId;
+        existing.updatedAt = now;
+        return existing;
+    }
+    const record: PhaseMessageRecord = {
+        messageRef: input.messageRef,
+        phaseId: input.phaseId,
+        role: input.role,
+        contentType: input.contentType,
+        tokenSize: Math.max(0, tokenSize),
+        lifecycle: "ACTIVE",
+        ...(input.operationId ? { operationId: input.operationId } : {}),
+        ...(input.requirementMessageId ? { requirementMessageId: input.requirementMessageId } : {}),
+        ...(input.payload !== undefined ? { payload: input.payload } : {}),
+        createdAt: now,
+        updatedAt: now,
+    };
+    state.phaseMessages[input.messageRef] = record;
+    const phase = state.phases[input.phaseId];
+    if (phase && !phase.itemKeys.includes(input.messageRef)) phase.itemKeys.push(input.messageRef);
+    return record;
+}
+
+export function markPhaseMessagesPendingDrop(
+    state: WorkflowState,
+    phaseId: string,
+    keepRefs: Set<string>,
+): void {
+    const phase = state.phases[phaseId];
+    if (!phase) return;
+    for (const message of Object.values(state.phaseMessages)) {
+        if (message.phaseId !== phaseId || message.lifecycle !== "ACTIVE") continue;
+        const operation = message.operationId ? state.operations[message.operationId] : undefined;
+        const kept = operation?.lifecycle === "KEEP"
+            || operation?.lifecycle === "CRITICAL"
+            || (operation ? operation.importance === "CRITICAL" : false)
+            || keepRefs.has(message.messageRef)
+            || (message.operationId ? keepRefs.has(message.operationId) : false);
+        if (kept) continue;
+        if (message.requirementMessageId) {
+            const requirementMessage = state.requirementMessages[message.requirementMessageId];
+            if (!requirementMessage || requirementMessage.lifecycle !== "PENDING_DROP") continue;
+        } else if (operation?.lifecycle === "PENDING_DROP") {
+        } else if (message.role !== "assistant") {
+            continue;
+        }
+        message.lifecycle = "PENDING_DROP";
+        message.updatedAt = Date.now();
+    }
 }
 
 export function recomputeWorkflowMetrics(state: WorkflowState): void {
     let rawToolTokens = 0;
     let visibleToolTokens = 0;
-    let pendingDropTokens = 0;
+    let pendingDropOperationTokens = 0;
+    let pendingDropMessageTokens = 0;
+    let pendingDropRequirementTokens = 0;
     for (const operation of Object.values(state.operations)) {
         rawToolTokens += operation.rawTokens;
         visibleToolTokens += operation.visibleTokens;
-        if (operation.lifecycle === "PENDING_DROP") pendingDropTokens += operation.visibleTokens;
+        if (operation.lifecycle === "PENDING_DROP") pendingDropOperationTokens += operation.visibleTokens;
+    }
+    for (const message of Object.values(state.phaseMessages)) {
+        if (message.lifecycle !== "PENDING_DROP") continue;
+        if (message.messageRef.endsWith(":call") || message.messageRef.endsWith(":result")) continue;
+        if (message.requirementMessageId) continue;
+        const isToolResult = message.contentType === "tool-result" || message.contentType.endsWith("_output");
+        if (message.operationId
+            && state.operations[message.operationId]?.lifecycle === "PENDING_DROP"
+            && isToolResult) continue;
+        pendingDropMessageTokens += message.tokenSize;
+    }
+    for (const message of Object.values(state.requirementMessages)) {
+        if (message.lifecycle === "PENDING_DROP") pendingDropRequirementTokens += message.tokenSize;
     }
     state.metrics.rawToolTokens = rawToolTokens;
     state.metrics.visibleToolTokens = visibleToolTokens;
     state.metrics.preIngestSavedTokens = Math.max(0, rawToolTokens - visibleToolTokens);
-    state.metrics.pendingDropTokens = pendingDropTokens;
+    state.metrics.pendingDropOperationTokens = pendingDropOperationTokens;
+    state.metrics.pendingDropMessageTokens = pendingDropMessageTokens;
+    state.metrics.pendingDropRequirementTokens = pendingDropRequirementTokens;
+    state.metrics.pendingDropTotalTokens = pendingDropOperationTokens
+        + pendingDropMessageTokens
+        + pendingDropRequirementTokens;
+    state.metrics.pendingDropTokens = state.metrics.pendingDropTotalTokens;
 }

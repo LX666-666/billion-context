@@ -4,6 +4,7 @@ import type {
     WorkflowOptions,
     WorkflowState,
 } from "./types.js";
+import { resolveTargetContextRatio } from "./model-profile.js";
 
 function clamp(value: number, minimum: number, maximum: number): number {
     return Math.min(maximum, Math.max(minimum, value));
@@ -112,13 +113,18 @@ export function evaluateCachePolicy(
     options: WorkflowOptions,
     contextTokens: number,
     modelContextLimit: number,
+    model?: string,
 ): CachePolicyDecision {
     const telemetry = state.cacheTelemetry;
     const context = finiteTokens(contextTokens || telemetry.lastContextTokens);
     const limit = finiteTokens(modelContextLimit);
     const pendingPhases = Object.values(state.phases).filter((phase) => phase.status === "PENDING_ROLLOVER");
     const phaseBoundary = pendingPhases.length > 0;
-    const pendingDropTokens = state.metrics.pendingDropTokens;
+    const pendingDropOperationTokens = state.metrics.pendingDropOperationTokens;
+    const pendingDropMessageTokens = state.metrics.pendingDropMessageTokens;
+    const pendingDropRequirementTokens = state.metrics.pendingDropRequirementTokens;
+    const pendingDropTotalTokens = state.metrics.pendingDropTotalTokens;
+    const pendingDropTokens = pendingDropTotalTokens;
     const contextRatio = limit > 0 ? context / limit : 0;
     const debugging = debuggingActive(state, options.cachePolicy.debuggingWindowOperations);
     const expected = expectedNextWorkTokens(state, options, debugging);
@@ -131,7 +137,7 @@ export function evaluateCachePolicy(
     const cacheHitRatio = telemetry.lastCacheHitRatio;
     const activeAfterDrop = Math.max(0, context - pendingDropTokens);
     const rewriteCost = Math.min(context, Math.max(activeAfterDrop, cached ?? 0));
-    const target = options.targetContextRatio;
+    const target = resolveTargetContextRatio(options, model);
     const contextPressure = Math.max(0, contextRatio - target) / Math.max(target, 0.01) * 1.4;
     const projectedPressure = Math.max(0, projectedRatio - target) / Math.max(target, 0.01) * 0.8;
     const garbagePressure = Math.min(2, pendingDropTokens / Math.max(1, options.rolloverMinTokens)) * 0.9;
@@ -189,9 +195,14 @@ export function evaluateCachePolicy(
         modelContextLimit: limit,
         contextRatio,
         targetContextRatio: target,
+        ...(model ? { model } : {}),
         ...(cached !== undefined ? { cachedTokens: cached } : {}),
         ...(cacheHitRatio !== undefined ? { cacheHitRatio: clamp(cacheHitRatio, 0, 1) } : {}),
         pendingDropTokens,
+        pendingDropOperationTokens,
+        pendingDropMessageTokens,
+        pendingDropRequirementTokens,
+        pendingDropTotalTokens,
         pendingPhaseCount: pendingPhases.length,
         phaseBoundary,
         contextGrowthTokens: telemetry.contextGrowthTokens,

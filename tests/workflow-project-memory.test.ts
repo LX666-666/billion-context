@@ -36,6 +36,7 @@ function checkpointPhase(state: ReturnType<typeof createInitialWorkflowState>, c
         decisions: [{ decision: "Keep exact identifiers", reason: "API symbol ExactName must remain stable", refs: ["raw_000777"] }],
         failedAttempts: ["ExactError E_TEST at src/exact-path.ts:42"],
         validation: ["304 tests passed"],
+        requirementUpdates: [{ id: "REQ-00001", status: "ACTIVE" }],
         blockers: ["BLOCKER-7 remains"],
         unresolvedIssues: ["Retry Windows diagnostic"],
         nextAction: "Read the current repository",

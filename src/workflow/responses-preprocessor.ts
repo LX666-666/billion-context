@@ -1,14 +1,15 @@
 import { createHash } from "node:crypto";
 import { responsesToCore, type ResponsesRequestBody, type ResponseInputItem } from "../responses.js";
 import type { Session } from "../session.js";
-import { archiveOperationOutput } from "./archive.js";
 import { applyDeferredRollover, checkpointRequest, workflowMemory } from "./context-gc.js";
 import { operationForCall, trackOperationCall, updateOperationResult } from "./operation-tracker.js";
 import { applyPlanUpdate } from "./plan-tracker.js";
 import { pruneWithCheapModel } from "./pruner/cheap-model.js";
-import { attachRawReference, pruneToolOutput } from "./pruner/index.js";
+import { commitSemanticPrune, pruneToolOutput } from "./pruner/index.js";
 import { hydrateProjectMemory, runCheapHistorian } from "./project-memory.js";
 import { syncRequirements } from "./requirements.js";
+import { capturePhaseMessage } from "./state.js";
+import { observePhaseBoundaryFallback } from "./phase-boundary.js";
 import {
     observeRepositoryOperation,
     refreshRepoBridge,
@@ -134,6 +135,41 @@ function assignItemPhase(session: Session, itemKey: string, phaseId: string | un
     if (!phase.itemKeys.includes(itemKey)) phase.itemKeys.push(itemKey);
 }
 
+function responseItemRole(item: ResponseInputItem): string {
+    if (item.type === "message") return String((item as Record<string, unknown>).role ?? "unknown");
+    if (item.type === "function_call" || item.type === "custom_tool_call") return "assistant";
+    if (item.type === "function_call_output" || item.type === "custom_tool_call_output") return "tool";
+    return "assistant";
+}
+
+function responseItemText(item: ResponseInputItem): string {
+    if (item.type === "message") {
+        const content = (item as Record<string, unknown>).content;
+        if (typeof content === "string") return content;
+        if (Array.isArray(content)) {
+            return content.map((part) => {
+                if (!part || typeof part !== "object") return "";
+                const text = (part as Record<string, unknown>).text;
+                return typeof text === "string" ? text : "";
+            }).join("\n");
+        }
+    }
+    const record = item as Record<string, unknown>;
+    return typeof record.arguments === "string"
+        ? record.arguments
+        : typeof record.input === "string"
+          ? record.input
+          : typeof record.output === "string"
+            ? record.output
+            : JSON.stringify(item);
+}
+
+function requirementMessageForResponseItem(state: Session["workflow"], item: ResponseInputItem): string | undefined {
+    if (item.type !== "message" || (item as Record<string, unknown>).role !== "user") return undefined;
+    const text = responseItemText(item);
+    return Object.values(state.requirementMessages).find((message) => message.detail === text)?.messageId;
+}
+
 function phaseItemCanDrop(item: ResponseInputItem): boolean {
     if (item.type === "message") return (item as Record<string, unknown>).role === "assistant";
     if (item.type === "function_call" || item.type === "function_call_output") return false;
@@ -164,9 +200,11 @@ export async function preprocessResponsesWorkflow(
         || repoProjectId(state.repoBridge)
         || projectIdentity(workspace);
     if (options.sessionGc) hydrateProjectMemory(session.id, state, options.memory.maxProjectSessions);
-    syncRequirements(state, responsesToCore(body).msgs, session.id);
+    const workflowProjection = responsesToCore(body);
+    syncRequirements(state, workflowProjection.msgs, session.id);
+    observePhaseBoundaryFallback(state, workflowProjection.msgs);
     if (options.sessionGc) await runCheapHistorian(session.id, state, options);
-    applyDeferredRollover(state, options, session.stats.lastInputTokens || session.stats.contextTokens, modelContextLimit);
+    applyDeferredRollover(state, options, session.stats.lastInputTokens || session.stats.contextTokens, modelContextLimit, body.model);
     const sourceInput = body.input.filter((item) => {
         return !((item as Record<string, unknown>).bili_workflow === true);
     });
@@ -191,6 +229,33 @@ export async function preprocessResponsesWorkflow(
         }
         assignItemPhase(session, itemKeys[index], state.activePhaseId);
     }
+    for (let index = 0; index < sourceInput.length; index++) {
+        const item = sourceInput[index];
+        const itemKey = itemKeys[index];
+        const phaseId = state.itemPhaseByKey[itemKey] ?? state.activePhaseId;
+        if (!phaseId) continue;
+        const call = callFields(item);
+        const output = outputFields(item);
+        const operation = call
+            ? operationForCall(state, call.callId)
+            : output
+              ? operationForCall(state, output.callId)
+              : undefined;
+        const requirementMessageId = requirementMessageForResponseItem(state, item);
+        capturePhaseMessage(state, {
+            phaseId,
+            messageRef: itemKey,
+            role: responseItemRole(item),
+            contentType: item.type === "message" ? "text" : item.type,
+            payload: JSON.stringify(item),
+            operationId: operation?.opId,
+            ...(requirementMessageId ? { requirementMessageId } : {}),
+        });
+        if (operation) {
+            const refs = output ? operation.resultRefs : call ? operation.callRefs : undefined;
+            if (refs && !refs.includes(itemKey)) refs.push(itemKey);
+        }
+    }
     const phaseObjective = state.activePhaseId ? state.phases[state.activePhaseId]?.objective : undefined;
     const requirementHint = Object.values(state.requirements)
         .filter((requirement) => requirement.status === "ACTIVE")
@@ -212,11 +277,8 @@ export async function preprocessResponsesWorkflow(
         }
         let result = pruneToolOutput(operation, output.output, options);
         result = await pruneWithCheapModel(operation, result, options, { phaseObjective, requirementHint });
-        if (result.semanticPruned && options.archiveSemanticRaw) {
-            const rawRef = archiveOperationOutput(session.id, state, operation, output.output, result.rawTokens);
-            if (rawRef) result = attachRawReference(result, rawRef);
-        }
-        updateOperationResult(state, operation, result.rawTokens, result.visibleTokens, result.text);
+        result = commitSemanticPrune(session.id, state, operation, output.output, result, options.archiveSemanticRaw);
+        updateOperationResult(state, operation, result.rawTokens, result.visibleTokens, result.text, output.output);
         if (result.semanticPruned) prunedOperations++;
         transformed.push(result.text === output.output ? item : { ...item, output: result.text });
     }
@@ -225,8 +287,13 @@ export async function preprocessResponsesWorkflow(
         if (call && operationArchived(session, call.callId)) return false;
         const output = outputFields(item);
         if (output && operationArchived(session, output.callId)) return false;
+        if (requirementMessageForResponseItem(state, item) && state.requirementMessages[requirementMessageForResponseItem(state, item) ?? ""]?.lifecycle === "ARCHIVED") return false;
         const phaseId = state.itemPhaseByKey[itemKeys[index]];
-        return !(phaseId && state.phases[phaseId]?.status === "ARCHIVED" && phaseItemCanDrop(item));
+        const phaseMessage = state.phaseMessages[itemKeys[index]];
+        return !(phaseId
+            && state.phases[phaseId]?.status === "ARCHIVED"
+            && phaseMessage?.lifecycle === "ARCHIVED"
+            && phaseItemCanDrop(item));
     });
     const memory = workflowMemory(state, options.rereadAfterPhase, options.memory.maxInjectedTokens);
     if (memory) filtered.push(workflowItem(memory));

@@ -114,7 +114,7 @@ test("Responses workflow prunes before ingest, archives raw output, checkpoints 
     }, options, 0, 400_000);
     assert.match(checkpointResult, /workflow_checkpoint OK/);
     assert.equal(session.workflow.operations[testOperation.opId].lifecycle, "ARCHIVED");
-    assert.equal(session.workflow.requirements["REQ-00001"].status, "SATISFIED");
+    assert.equal(session.workflow.requirements["REQ-00001"].status, "HISTORICAL");
 
     const third = await preprocessResponsesWorkflow({ model: "gpt-5-codex", input: completedInput }, session, options, 400_000, true);
     const thirdText = JSON.stringify(third.body.input);

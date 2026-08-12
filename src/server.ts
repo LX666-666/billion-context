@@ -640,7 +640,7 @@ async function prepareAnthropic(
     try {
         const converted = anthropicToCore(parsed);
         const cacheControls = converted.cacheControls;
-        const msgs = await preprocessCoreWorkflow(converted.msgs, session, workflowOptions, extractSystem(parsed.system), config.modelContextLimit);
+        const msgs = await preprocessCoreWorkflow(converted.msgs, session, workflowOptions, extractSystem(parsed.system), config.modelContextLimit, parsed.model);
         originalMessages = msgs;
         // tokenCount drives the nudge decision ("should we compress?"). It MUST
         // be the real context size, never an estimate — estimates undercount
@@ -722,7 +722,7 @@ async function prepareOpenai(
 
     try {
         const converted = openaiToCore(parsed);
-        const msgs = await preprocessCoreWorkflow(converted.msgs, session, workflowOptions, undefined, config.modelContextLimit);
+        const msgs = await preprocessCoreWorkflow(converted.msgs, session, workflowOptions, undefined, config.modelContextLimit, parsed.model);
         originalMessages = msgs;
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment). Never an estimate.

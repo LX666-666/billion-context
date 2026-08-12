@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { evaluateCachePolicy, recordWorkflowUsage } from "../src/workflow/cache-policy.ts";
 import { applyDeferredRollover } from "../src/workflow/context-gc.ts";
+import { archivePhase } from "../src/workflow/archive.ts";
 import { trackOperationCall, updateOperationResult } from "../src/workflow/operation-tracker.ts";
 import { ensureActivePhase, createInitialWorkflowState, recomputeWorkflowMetrics } from "../src/workflow/state.ts";
 import { DEFAULT_WORKFLOW_OPTIONS, type WorkflowOptions, type WorkflowState } from "../src/workflow/types.ts";
@@ -22,7 +23,9 @@ function pendingPhase(state: WorkflowState, visibleTokens: number): void {
     operation.lifecycle = "PENDING_DROP";
     const phase = state.phases[operation.phaseId];
     phase.status = "PENDING_ROLLOVER";
+    phase.completedAt = Date.now();
     state.activePhaseId = undefined;
+    assert.equal(archivePhase("cache-policy-test", state, phase.phaseId).committed, true);
     recomputeWorkflowMetrics(state);
 }
 

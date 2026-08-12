@@ -92,19 +92,33 @@ function modelPatch(value: unknown, name: string, includeMinTokens: boolean): Js
 
 function workflowPatch(value: unknown): JsonObject {
     const source = plainObject(value, "workflow");
-    allowedKeys(source, "workflow", ["enabled", "projectKey", "context", "code", "pruner", "archive", "repoBridge", "cache", "memory", "historian"]);
+    allowedKeys(source, "workflow", ["enabled", "projectKey", "context", "models", "code", "pruner", "archive", "repoBridge", "cache", "memory", "historian"]);
     const target: JsonObject = {};
     copyBoolean(source, target, "enabled", "workflow");
     copyString(source, target, "projectKey", "workflow", true);
     if (source.context !== undefined) {
         const input = plainObject(source.context, "workflow.context");
-        allowedKeys(input, "workflow.context", ["targetRatio", "phaseGc", "sessionGc", "rolloverMinTokens"]);
+        allowedKeys(input, "workflow.context", ["targetRatio", "defaultTargetRatio", "phaseGc", "sessionGc", "rolloverMinTokens"]);
         const output: JsonObject = {};
         copyNumber(input, output, "targetRatio", "workflow.context", "ratio");
+        copyNumber(input, output, "defaultTargetRatio", "workflow.context", "ratio");
         copyBoolean(input, output, "phaseGc", "workflow.context");
         copyBoolean(input, output, "sessionGc", "workflow.context");
         copyNumber(input, output, "rolloverMinTokens", "workflow.context", "integer");
         target.context = output;
+    }
+    if (source.models !== undefined) {
+        const input = plainObject(source.models, "workflow.models");
+        const output: JsonObject = {};
+        for (const [pattern, value] of Object.entries(input)) {
+            const profile = plainObject(value, `workflow.models.${pattern}`);
+            allowedKeys(profile, `workflow.models.${pattern}`, ["targetRatio", "targetContextRatio"]);
+            const profileOutput: JsonObject = {};
+            copyNumber(profile, profileOutput, "targetRatio", `workflow.models.${pattern}`, "ratio");
+            copyNumber(profile, profileOutput, "targetContextRatio", `workflow.models.${pattern}`, "ratio");
+            output[pattern] = profileOutput;
+        }
+        target.models = output;
     }
     if (source.code !== undefined) {
         const input = plainObject(source.code, "workflow.code");

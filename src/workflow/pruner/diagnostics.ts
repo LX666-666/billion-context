@@ -24,6 +24,27 @@ export function outputFailed(text: string, code = exitCode(text)): boolean {
     return /(?:^|\n)\s*(?:npm ERR!|error:(?!\s*0\b)|fatal:|panic:|FAIL(?:ED)?\b(?!\s*[:=]?\s*0\b)|status\s*[:=]\s*failed\b|[1-9]\d*\s+failed\b|Traceback \(most recent call last\)|Unhandled (?:exception|rejection)|segmentation fault|core dumped)|\bcommand failed\b/i.test(text);
 }
 
+export type ValidationOutcome = "PASS" | "FAIL" | "UNKNOWN";
+
+export function validationOutcome(text: string, type: "TEST" | "BUILD" | "RUN"): ValidationOutcome {
+    const code = exitCode(text);
+    if (outputFailed(text, code)) return "FAIL";
+    if (code !== undefined) return code === "0" ? "PASS" : "FAIL";
+    if (type === "TEST") {
+        const failed = /(?:^|\n)\s*(?:fail|failed|failures?)\s*[:=]?\s*(\d+)/im.exec(text)?.[1]
+            ?? /(\d+)\s+failed\b/i.exec(text)?.[1];
+        if (failed !== undefined && failed !== "0") return "FAIL";
+        if (failed === "0" && /(?:\b(?:pass|passed|tests?|suites?)\b|success)/i.test(text)) return "PASS";
+        if (/\b(?:all tests passed|tests? passed|test suite passed|passed)\b/i.test(text)) return "PASS";
+    } else if (type === "BUILD") {
+        if (/\b(?:build|compile|typecheck)\s+(?:succeeded|successful|passed|complete|completed|ok)\b/i.test(text)) return "PASS";
+        if (/\b(?:build|compile|typecheck)\s+passed\b|\bcompiled successfully\b/i.test(text)) return "PASS";
+    } else if (/\b(?:command|process|run)\s+(?:succeeded|successful|completed successfully|passed)\b/i.test(text)) {
+        return "PASS";
+    }
+    return "UNKNOWN";
+}
+
 function diagnosticContext(line: string): boolean {
     return /^\s+(?:at\s|File\s+"|\^+|~+|Caused by:|\.\.\.|[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception)\b)/.test(line);
 }

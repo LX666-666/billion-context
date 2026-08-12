@@ -92,7 +92,7 @@ test("Responses workflow tools remain intercepted when ACP compression tools are
         assert.doesNotMatch(JSON.stringify(body), /expand_operation/);
         assert.equal(captured.length, 2);
         const firstTools = captured[0].tools as Array<Record<string, unknown>>;
-        assert.deepEqual(firstTools.map((tool) => tool.name), ["workflow_checkpoint", "retrieve_raw", "expand_operation"]);
+        assert.deepEqual(firstTools.map((tool) => tool.name), ["workflow_checkpoint", "workflow_mark", "retrieve_raw", "expand_operation"]);
         const secondInput = captured[1].input as Array<Record<string, unknown>>;
         const toolResult = secondInput.find((item) => item.type === "function_call_output" && item.call_id === "proxy-call");
         assert.ok(toolResult);

@@ -1,7 +1,7 @@
 export function buildWorkflowSystemPrompt(textProtocol: boolean): string {
     const checkpoint = textProtocol
-        ? "When a workflow checkpoint is requested, emit the exact <workflow_checkpoint>{JSON}</workflow_checkpoint> marker requested, with no surrounding prose. To recover an archive emit <retrieve_raw>{\"rawRef\":\"raw_000001\"}</retrieve_raw>. To inspect an operation emit <expand_operation>{\"opId\":\"op00001\"}</expand_operation>."
-        : "When a workflow checkpoint is requested, call workflow_checkpoint before continuing.";
+        ? "When a workflow checkpoint is requested, emit the exact <workflow_checkpoint>{JSON}</workflow_checkpoint> marker requested, with no surrounding prose. To mark delivered operations emit <workflow_mark>{\"operations\":[{\"opId\":\"op00001\",\"state\":\"CONSUMED\"}]}</workflow_mark>. To recover an archive emit <retrieve_raw>{\"rawRef\":\"raw_000001\"}</retrieve_raw>. To inspect an operation emit <expand_operation>{\"opId\":\"op00001\"}</expand_operation>."
+        : "When a workflow checkpoint is requested, call workflow_checkpoint before continuing. After a batch of tool results has been used, you may call workflow_mark with CONSUMED, KEEP, or CRITICAL operation states; never mark ARCHIVED.";
     return `WORKFLOW CONTEXT MANAGER
 
 The repository and current filesystem are the source of truth for code. Context is working memory.

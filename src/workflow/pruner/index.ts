@@ -1,9 +1,10 @@
 import { estimateTokensFast } from "acp-kernel";
 import { protectsCodeContent } from "../operation-classifier.js";
-import type { OperationRecord, WorkflowOptions } from "../types.js";
+import { archiveOperationOutput } from "../archive.js";
 import { cleanDeterministic } from "./deterministic.js";
+import type { OperationRecord, WorkflowOptions } from "../types.js";
 import { guardedOperationOutput } from "../repo-bridge.js";
-import { diagnosticLines, duration, environmentLines, exitCode, outputFailed } from "./diagnostics.js";
+import { diagnosticLines, duration, environmentLines, exitCode, validationOutcome } from "./diagnostics.js";
 import { summarizeMachineJson } from "./json.js";
 import { summarizeRun } from "./run.js";
 
@@ -13,12 +14,48 @@ export type PrunedToolOutput = {
     visibleTokens: number;
     semanticPruned: boolean;
     noiseRemoved: boolean;
+    archiveFailed?: boolean;
 };
 
 export function attachRawReference(result: PrunedToolOutput, rawRef: string): PrunedToolOutput {
     if (!result.semanticPruned || result.text.includes(`raw_ref: ${rawRef}`)) return result;
     const text = `${result.text}\nraw_ref: ${rawRef}`;
     return { ...result, text, visibleTokens: estimateTokensFast(text) };
+}
+
+export function commitSemanticPrune(
+    sessionId: string,
+    state: import("../types.js").WorkflowState,
+    operation: OperationRecord,
+    raw: string,
+    result: PrunedToolOutput,
+    archiveEnabled: boolean,
+): PrunedToolOutput {
+    if (!result.semanticPruned) return result;
+    if (!archiveEnabled) {
+        const cleaned = cleanDeterministic(raw);
+        return {
+            text: cleaned.text,
+            rawTokens: result.rawTokens,
+            visibleTokens: estimateTokensFast(cleaned.text),
+            semanticPruned: false,
+            noiseRemoved: cleaned.changed,
+            archiveFailed: true,
+        };
+    }
+    const rawRef = archiveOperationOutput(sessionId, state, operation, raw, result.rawTokens);
+    if (!rawRef) {
+        const cleaned = cleanDeterministic(raw);
+        return {
+            text: cleaned.text,
+            rawTokens: result.rawTokens,
+            visibleTokens: estimateTokensFast(cleaned.text),
+            semanticPruned: false,
+            noiseRemoved: cleaned.changed,
+            archiveFailed: true,
+        };
+    }
+    return attachRawReference(result, rawRef);
 }
 
 function referenceLine(rawRef: string | undefined): string {
@@ -34,9 +71,10 @@ function testSummary(text: string, operation: OperationRecord, rawRef: string | 
     const skipped = /(?:^|\n)\s*skipped\s*[:=]?\s*(\d+)/im.exec(text)?.[1]?.trim()
         ?? /(\d+)\s+skipped\b/i.exec(text)?.[1]?.trim();
     const elapsed = duration(text);
-    const isFailure = outputFailed(text, code) || (failed !== undefined && failed !== "0") || /\b(test|tests?)\s+failed\b/i.test(text);
+    const outcome = validationOutcome(text, "TEST");
+    const isFailure = outcome === "FAIL" || (failed !== undefined && failed !== "0") || /\b(test|tests?)\s+failed\b/i.test(text);
     const lines = [
-        isFailure ? "[TEST FAILED]" : "[TEST PASS]",
+        isFailure ? "[TEST FAILED]" : outcome === "PASS" ? "[TEST PASS]" : "[TEST UNKNOWN]",
         `op_id: ${operation.opId}`,
         operation.command ? `command: ${operation.command}` : undefined,
         code !== undefined ? `exit_code: ${code}` : undefined,
@@ -48,6 +86,12 @@ function testSummary(text: string, operation: OperationRecord, rawRef: string | 
     if (isFailure) {
         const relevant = diagnosticLines(text);
         if (relevant.length > 0) lines.push("", "exact_errors:", ...relevant);
+    } else if (outcome === "UNKNOWN") {
+        const excerpt = text.split(/\r?\n/);
+        lines.push("", "output_head:", ...excerpt.slice(0, 24));
+        if (excerpt.length > 32) lines.push("[... output omitted ...]", ...excerpt.slice(-12));
+        const relevant = diagnosticLines(text);
+        if (relevant.length > 0) lines.push("", "diagnostics:", ...relevant);
     }
     const environment = environmentLines(text);
     if (environment.length > 0) lines.push("", "environment:", ...environment);
@@ -59,9 +103,10 @@ function buildSummary(text: string, operation: OperationRecord, rawRef: string |
     const elapsed = duration(text);
     const warnings = /(?:warnings?|warn)\s*[:=]\s*(\d+)/i.exec(text)?.[1]?.trim();
     const errors = /(?:errors?)\s*[:=]\s*(\d+)/i.exec(text)?.[1]?.trim();
-    const isFailure = outputFailed(text, code) || (errors !== undefined && errors !== "0") || /\b(build|compile|typecheck)\s+failed\b/i.test(text);
+    const outcome = validationOutcome(text, "BUILD");
+    const isFailure = outcome === "FAIL" || (errors !== undefined && errors !== "0") || /\b(build|compile|typecheck)\s+failed\b/i.test(text);
     const lines = [
-        isFailure ? "[BUILD FAILED]" : "[BUILD PASS]",
+        isFailure ? "[BUILD FAILED]" : outcome === "PASS" ? "[BUILD PASS]" : "[BUILD UNKNOWN]",
         `op_id: ${operation.opId}`,
         operation.command ? `command: ${operation.command}` : undefined,
         code !== undefined ? `exit_code: ${code}` : undefined,
@@ -72,6 +117,12 @@ function buildSummary(text: string, operation: OperationRecord, rawRef: string |
     if (isFailure) {
         const relevant = diagnosticLines(text);
         if (relevant.length > 0) lines.push("", "exact_errors:", ...relevant);
+    } else if (outcome === "UNKNOWN") {
+        const excerpt = text.split(/\r?\n/);
+        lines.push("", "output_head:", ...excerpt.slice(0, 24));
+        if (excerpt.length > 32) lines.push("[... output omitted ...]", ...excerpt.slice(-12));
+        const relevant = diagnosticLines(text);
+        if (relevant.length > 0) lines.push("", "diagnostics:", ...relevant);
     }
     const environment = environmentLines(text);
     if (environment.length > 0) lines.push("", "environment:", ...environment);

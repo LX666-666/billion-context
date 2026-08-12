@@ -7,6 +7,7 @@ import { log as loggerLog } from "../logger.js";
 import { markPhaseRepositoryStateStale } from "./repo-bridge.js";
 import type {
     HistoricalRequirement,
+    HistoricalRequirementMessage,
     ProjectCheckpoint,
     ProjectHistorySession,
     ProjectHistorySnapshot,
@@ -60,6 +61,20 @@ function historicalRequirement(requirement: RequirementRecord): HistoricalRequir
     };
 }
 
+function historicalRequirementMessage(
+    message: import("./types.js").RequirementMessageRecord,
+): HistoricalRequirementMessage {
+    return {
+        messageId: message.messageId,
+        sourceRefs: [...message.sourceRefs],
+        detail: message.detail,
+        requirementIds: [...message.requirementIds],
+        ...(message.rawRef ? { rawRef: message.rawRef } : {}),
+        tokenSize: message.tokenSize,
+        ...(message.historicalAt ? { historicalAt: message.historicalAt } : {}),
+    };
+}
+
 function taskCheckpoints(state: WorkflowState, task: TaskRecord | undefined): WorkflowCheckpoint[] {
     const selected = task
         ? task.checkpointIds.map((checkpointId) => state.checkpoints[checkpointId]).filter((checkpoint) => Boolean(checkpoint))
@@ -88,6 +103,10 @@ export function buildSessionCheckpoint(state: WorkflowState, taskId?: string): S
     const task = taskId ? state.tasks[taskId] : undefined;
     const checkpoints = taskCheckpoints(state, task);
     const requirements = taskRequirements(state, task).map(historicalRequirement);
+    const requirementIds = new Set(requirements.map((requirement) => requirement.id));
+    const requirementMessages = Object.values(state.requirementMessages)
+        .filter((message) => message.requirementIds.some((id) => requirementIds.has(id)))
+        .map((message) => historicalRequirementMessage(message));
     const failedAttempts = uniqueStrings(checkpoints.flatMap((checkpoint) => checkpoint.failedAttempts));
     const blockers = uniqueStrings(checkpoints.flatMap((checkpoint) => checkpoint.blockers));
     const phaseIds = new Set(task?.phaseIds ?? checkpoints.map((checkpoint) => checkpoint.phaseId));
@@ -98,6 +117,7 @@ export function buildSessionCheckpoint(state: WorkflowState, taskId?: string): S
         ...(task ? { taskId: task.taskId, taskStatus: task.status } : {}),
         phaseCheckpointIds: checkpoints.map((checkpoint) => checkpoint.checkpointId),
         requirements,
+        requirementMessages,
         requirementStates: uniqueStrings(checkpoints.flatMap((checkpoint) => checkpoint.requirementState ? [checkpoint.requirementState] : [])),
         objectives: uniqueStrings([...(task ? [task.objective] : []), ...checkpoints.map((checkpoint) => checkpoint.objective)]),
         completedWork: uniqueStrings(checkpoints.map((checkpoint) => checkpoint.completedWork)),
@@ -282,12 +302,23 @@ function mergeRequirements(values: HistoricalRequirement[]): HistoricalRequireme
     });
 }
 
+function mergeRequirementMessages(values: HistoricalRequirementMessage[]): HistoricalRequirementMessage[] {
+    const seen = new Set<string>();
+    return values.filter((message) => {
+        const key = JSON.stringify([message.messageId, message.detail, message.rawRef, message.requirementIds]);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+}
+
 function mergeProjectCheckpoint(sessions: ProjectHistorySession[]): ProjectCheckpoint {
     const checkpoints = sessions.map((session) => session.checkpoint);
     return {
         level: "PROJECT",
         sessionKeys: uniqueStrings(sessions.map((session) => session.sessionKey)),
         requirements: mergeRequirements(sessions.flatMap((session) => session.requirements)),
+        requirementMessages: mergeRequirementMessages(sessions.flatMap((session) => session.checkpoint.requirementMessages ?? session.requirementMessages ?? [])),
         requirementStates: uniqueStrings(checkpoints.flatMap((checkpoint) => checkpoint.requirementStates ?? [])),
         objectives: uniqueStrings(checkpoints.flatMap((checkpoint) => checkpoint.objectives)),
         completedWork: uniqueStrings(checkpoints.flatMap((checkpoint) => checkpoint.completedWork)),
@@ -319,6 +350,7 @@ function taskEntries(sessionId: string, state: WorkflowState): ProjectHistorySes
             sessionKey: key,
             updatedAt: Date.now(),
             requirements: checkpoint.requirements ?? [],
+            requirementMessages: checkpoint.requirementMessages,
             checkpoint,
         }] : [];
     }
@@ -332,6 +364,7 @@ function taskEntries(sessionId: string, state: WorkflowState): ProjectHistorySes
             taskStatus: task.status,
             updatedAt: task.updatedAt,
             requirements: checkpoint.requirements ?? [],
+            requirementMessages: checkpoint.requirementMessages,
             checkpoint,
         }];
     });

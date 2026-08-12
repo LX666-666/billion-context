@@ -70,7 +70,7 @@ function anthropicEvent(type: string, value: Record<string, unknown>): string {
 }
 
 test("Anthropic and OpenAI inject the six universal context tools", () => {
-    const names = ["compress", "decompress", "search_context", "acp_status", "retrieve_raw", "expand_operation"];
+    const names = ["compress", "decompress", "search_context", "acp_status", "workflow_checkpoint", "workflow_mark", "retrieve_raw", "expand_operation"];
     assert.deepEqual(ACP_TOOLS_ANTHROPIC.map((tool) => tool.name), names);
     assert.deepEqual(ACP_TOOLS_OPENAI.map((tool) => tool.function.name), names);
 });

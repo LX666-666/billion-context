@@ -24,6 +24,8 @@ import {
     ACP_DECOMPRESS_CLOSE,
     WORKFLOW_TEXT_OPEN,
     WORKFLOW_TEXT_CLOSE,
+    WORKFLOW_MARK_TEXT_OPEN,
+    WORKFLOW_MARK_TEXT_CLOSE,
     RETRIEVE_RAW_TEXT_OPEN,
     RETRIEVE_RAW_TEXT_CLOSE,
     EXPAND_OPERATION_TEXT_OPEN,
@@ -39,6 +41,7 @@ import { captureUsage, type UsageCaptureCtx } from "./usage/capture.js";
 import { expandOperation, retrieveRawOutput } from "./workflow/archive.js";
 import { recordWorkflowUsage } from "./workflow/cache-policy.js";
 import { recordWorkflowCheckpoint } from "./workflow/context-gc.js";
+import { markWorkflowOperations } from "./workflow/operation-tracker.js";
 import { DEFAULT_WORKFLOW_OPTIONS, type WorkflowOptions } from "./workflow/types.js";
 import { saveProjectMemory } from "./workflow/project-memory.js";
 import { preprocessResponsesWorkflow } from "./workflow/responses-preprocessor.js";
@@ -59,6 +62,7 @@ const TEXT_TRIGGERS = [
     { open: ACP_SEARCH_OPEN, close: ACP_SEARCH_CLOSE, name: "search_context" },
     { open: ACP_DECOMPRESS_OPEN, close: ACP_DECOMPRESS_CLOSE, name: "decompress" },
     { open: WORKFLOW_TEXT_OPEN, close: WORKFLOW_TEXT_CLOSE, name: "workflow_checkpoint" },
+    { open: WORKFLOW_MARK_TEXT_OPEN, close: WORKFLOW_MARK_TEXT_CLOSE, name: "workflow_mark" },
     { open: RETRIEVE_RAW_TEXT_OPEN, close: RETRIEVE_RAW_TEXT_CLOSE, name: "retrieve_raw" },
     { open: EXPAND_OPERATION_TEXT_OPEN, close: EXPAND_OPERATION_TEXT_CLOSE, name: "expand_operation" },
 ] as const;
@@ -165,11 +169,17 @@ function executeProxyTool(
             ctx.workflowOptions ?? DEFAULT_WORKFLOW_OPTIONS,
             ctx.session.stats.lastInputTokens || ctx.session.stats.contextTokens,
             ctx.config.modelContextLimit,
+            ctx.session.id,
         );
         const workflowOptions = ctx.workflowOptions ?? DEFAULT_WORKFLOW_OPTIONS;
         if (result.includes("workflow_checkpoint OK") && workflowOptions.sessionGc) {
             saveProjectMemory(ctx.session.id, ctx.session.workflow);
         }
+        markDirty(ctx.session);
+        return result;
+    }
+    if (toolName === "workflow_mark") {
+        const result = markWorkflowOperations(ctx.session.workflow, args);
         markDirty(ctx.session);
         return result;
     }
@@ -530,7 +540,7 @@ export async function compressLoopResponsesJson(
                 : { type: "function_call_output", call_id: call.callId, output: result });
         }
         requestBody.input = inputItems;
-        if (proxyCalls.some((call) => call.name === "workflow_checkpoint")) {
+        if (proxyCalls.some((call) => call.name === "workflow_checkpoint" || call.name === "workflow_mark")) {
             await refreshWorkflowRequest(requestBody, ctx, textProtocol);
         }
         const { response, clearTimer } = await fetchWithTimeout(requestOptions.url, {
@@ -819,7 +829,7 @@ export async function* compressLoopResponsesStream(
         }
 
         requestBody.input = inputItems;
-        if (proxyCalls.some((call) => call.name === "workflow_checkpoint")) {
+        if (proxyCalls.some((call) => call.name === "workflow_checkpoint" || call.name === "workflow_mark")) {
             await refreshWorkflowRequest(requestBody, ctx, textProtocol);
         }
         if (!("stream" in requestBody)) requestBody.stream = true;

@@ -288,13 +288,15 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
             throw new Error(`[acp-config] invalid workflow.historian.endpoint protocol: ${parsedHistorianEndpoint.protocol}`);
         }
     }
+    const workflowModels = parseWorkflowModels(fileConfig.workflow?.models);
     const workflow: WorkflowOptions = {
         enabled: (env.BILI_WORKFLOW_ENABLED ?? (fileConfig.workflow?.enabled === false ? "0" : "1")) !== "0",
         targetContextRatio: parseWorkflowRatio(
-            env.BILI_WORKFLOW_TARGET_RATIO ?? fileConfig.workflow?.context?.targetRatio,
+            env.BILI_WORKFLOW_TARGET_RATIO ?? fileConfig.workflow?.context?.targetRatio ?? fileConfig.workflow?.context?.defaultTargetRatio,
             "workflow.context.targetRatio",
             0.2,
         ),
+        ...(workflowModels ? { models: workflowModels } : {}),
         phaseGc: (env.BILI_WORKFLOW_PHASE_GC ?? (fileConfig.workflow?.context?.phaseGc === false ? "0" : "1")) !== "0",
         sessionGc: (env.BILI_WORKFLOW_SESSION_GC ?? (fileConfig.workflow?.context?.sessionGc === false ? "0" : "1")) !== "0",
         rereadAfterPhase: (env.BILI_WORKFLOW_REREAD_AFTER_PHASE ?? (fileConfig.workflow?.code?.rereadAfterPhase === false ? "0" : "1")) !== "0",
@@ -474,7 +476,8 @@ type FileConfig = {
     workflow?: {
         enabled?: boolean;
         projectKey?: string;
-        context?: { targetRatio?: number; phaseGc?: boolean; sessionGc?: boolean; rolloverMinTokens?: number };
+        context?: { targetRatio?: number; defaultTargetRatio?: number; phaseGc?: boolean; sessionGc?: boolean; rolloverMinTokens?: number };
+        models?: Record<string, { targetRatio?: number; targetContextRatio?: number }>;
         code?: { rereadAfterPhase?: boolean };
         pruner?: {
             enabled?: boolean;
@@ -543,6 +546,32 @@ function parseWorkflowInteger(value: unknown, name: string, fallback: number): n
         throw new Error(`[acp-config] invalid ${name}: ${JSON.stringify(value)} — must be a positive integer`);
     }
     return parsed;
+}
+
+function parseWorkflowModels(value: unknown): Record<string, { targetRatio?: number; targetContextRatio?: number }> | undefined {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== "object" || Array.isArray(value)) throw new Error("[acp-config] invalid workflow.models: must be an object");
+    const result: Record<string, { targetRatio?: number; targetContextRatio?: number }> = {};
+    for (const [pattern, raw] of Object.entries(value as Record<string, unknown>)) {
+        if (!pattern.trim() || !raw || typeof raw !== "object" || Array.isArray(raw)) {
+            throw new Error(`[acp-config] invalid workflow.models.${pattern}`);
+        }
+        const record = raw as Record<string, unknown>;
+        const targetRatio = record.targetRatio === undefined
+            ? undefined
+            : parseWorkflowRatio(record.targetRatio, `workflow.models.${pattern}.targetRatio`, 0.2);
+        const targetContextRatio = record.targetContextRatio === undefined
+            ? undefined
+            : parseWorkflowRatio(record.targetContextRatio, `workflow.models.${pattern}.targetContextRatio`, 0.2);
+        if (targetRatio === undefined && targetContextRatio === undefined) {
+            throw new Error(`[acp-config] invalid workflow.models.${pattern}: targetRatio is required`);
+        }
+        result[pattern] = {
+            ...(targetRatio !== undefined ? { targetRatio } : {}),
+            ...(targetContextRatio !== undefined ? { targetContextRatio } : {}),
+        };
+    }
+    return Object.keys(result).length > 0 ? result : undefined;
 }
 
 function parseWorkflowPositive(value: unknown, name: string, fallback: number): number {

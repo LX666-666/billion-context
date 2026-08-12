@@ -12,7 +12,27 @@ export type OperationType =
     | "PLAN"
     | "OTHER";
 
-export type OperationLifecycle = "ACTIVE" | "CONSUMED" | "PENDING_DROP" | "ARCHIVED";
+export type OperationLifecycle =
+    | "ACTIVE"
+    | "DELIVERED"
+    | "CONSUMED"
+    | "KEEP"
+    | "CRITICAL"
+    | "PENDING_DROP"
+    | "ARCHIVED";
+
+export type RequirementStatus =
+    | "ACTIVE"
+    | "ACTIVE_CURRENT"
+    | "ACTIVE_STABLE"
+    | "SATISFIED"
+    | "SUPERSEDED"
+    | "CANCELLED"
+    | "HISTORICAL";
+
+export type PhaseMessageLifecycle = "ACTIVE" | "PENDING_DROP" | "ARCHIVED";
+
+export type RequirementMessageLifecycle = "ACTIVE" | "PENDING_DROP" | "ARCHIVED";
 
 export type OperationRecord = {
     opId: string;
@@ -48,14 +68,36 @@ export type OperationRecord = {
 export type RequirementRecord = {
     id: string;
     sourceRefs: string[];
+    messageId?: string;
+    parentMessageId?: string;
     detail: string;
-    status: "ACTIVE" | "SATISFIED" | "SUPERSEDED" | "CANCELLED";
+    status: RequirementStatus;
     supersededBy?: string;
     importance: "NORMAL" | "CRITICAL";
     preserveRaw: boolean;
     rawRef?: string;
+    historicalDetail?: string;
     taskId?: string;
     createdAt: number;
+};
+
+export type RequirementMessageRecord = {
+    messageId: string;
+    sourceRefs: string[];
+    detail: string;
+    requirementIds: string[];
+    rawRef?: string;
+    tokenSize: number;
+    lifecycle: RequirementMessageLifecycle;
+    createdAt: number;
+    historicalAt?: number;
+};
+
+export type HistoricalRequirementMessage = Pick<
+    RequirementMessageRecord,
+    "messageId" | "sourceRefs" | "detail" | "requirementIds" | "rawRef" | "tokenSize"
+> & {
+    historicalAt?: number;
 };
 
 export type PlanStepStatus = "pending" | "in_progress" | "completed";
@@ -63,6 +105,7 @@ export type PlanStepStatus = "pending" | "in_progress" | "completed";
 export type PlanStepRecord = {
     step: string;
     status: PlanStepStatus;
+    planItemId?: string;
 };
 
 export type PlanRecord = {
@@ -108,6 +151,75 @@ export type PhaseRecord = {
     completedAt?: number;
     checkpointId?: string;
     taskId?: string;
+    planItemId?: string;
+    archiveStatus?: "PENDING" | "COMMITTED" | "FAILED";
+    archiveRef?: string;
+    archiveChecksum?: string;
+    archiveError?: string;
+};
+
+export type PhaseMessageRecord = {
+    messageRef: string;
+    phaseId: string;
+    role: string;
+    contentType: string;
+    tokenSize: number;
+    lifecycle: PhaseMessageLifecycle;
+    operationId?: string;
+    requirementMessageId?: string;
+    payload?: string;
+    payloadRef?: string;
+    createdAt: number;
+    updatedAt: number;
+};
+
+export type PhaseArchiveMessageEntry = {
+    messageRef: string;
+    role: string;
+    contentType: string;
+    tokenSize: number;
+    operationId?: string;
+    requirementMessageId?: string;
+    payload?: string;
+    payloadRef?: string;
+};
+
+export type PhaseArchiveOperationEntry = {
+    opId: string;
+    type: OperationType;
+    lifecycle: OperationLifecycle;
+    callRefs: string[];
+    resultRefs: string[];
+    toolCallId?: string;
+    command?: string;
+    workdir?: string;
+    path?: string;
+    paths: string[];
+    addedPaths: string[];
+    rawRef?: string;
+    callPayloadRef?: string;
+    resultPayloadRef?: string;
+    outcome?: OperationRecord["outcome"];
+};
+
+export type PhaseArchive = {
+    phaseId: string;
+    taskId?: string;
+    objective: string;
+    createdAt: number;
+    completedAt?: number;
+    checkpointId?: string;
+    messageEntries: PhaseArchiveMessageEntry[];
+    operations: PhaseArchiveOperationEntry[];
+    changedFiles: string[];
+    checkpointRef?: string;
+    checksum: string;
+};
+
+export type CheckpointValidationResult = {
+    valid: boolean;
+    errors: string[];
+    warnings: string[];
 };
 
 export type RawArchiveIndexRecord = {
@@ -115,7 +227,7 @@ export type RawArchiveIndexRecord = {
     opId?: string;
     requirementId?: string;
     phaseId?: string;
-    type: OperationType | "REQUIREMENT";
+    type: OperationType | "REQUIREMENT" | "MESSAGE";
     tokenCount: number;
     checksum: string;
     createdAt: number;
@@ -126,6 +238,10 @@ export type WorkflowMetrics = {
     visibleToolTokens: number;
     preIngestSavedTokens: number;
     pendingDropTokens: number;
+    pendingDropOperationTokens: number;
+    pendingDropMessageTokens: number;
+    pendingDropRequirementTokens: number;
+    pendingDropTotalTokens: number;
     rollovers: number;
     checkpointTokens: number;
     rawRetrievals: number;
@@ -137,6 +253,8 @@ export type WorkflowMetrics = {
     taskBoundaries: number;
     historianRuns: number;
     historianFailures: number;
+    checkpointRejects: number;
+    checkpointRetries: number;
 };
 
 export type CacheUsageSample = {
@@ -155,9 +273,14 @@ export type CachePolicyDecision = {
     modelContextLimit: number;
     contextRatio: number;
     targetContextRatio: number;
+    model?: string;
     cachedTokens?: number;
     cacheHitRatio?: number;
     pendingDropTokens: number;
+    pendingDropOperationTokens: number;
+    pendingDropMessageTokens: number;
+    pendingDropRequirementTokens: number;
+    pendingDropTotalTokens: number;
     pendingPhaseCount: number;
     phaseBoundary: boolean;
     contextGrowthTokens: number;
@@ -241,6 +364,7 @@ export type SessionCheckpoint = {
     taskStatus?: TaskRecord["status"];
     phaseCheckpointIds?: string[];
     requirements?: HistoricalRequirement[];
+    requirementMessages?: HistoricalRequirementMessage[];
     requirementStates?: string[];
     objectives: string[];
     completedWork: string[];
@@ -274,6 +398,7 @@ export type ProjectHistorySession = {
     taskStatus?: TaskRecord["status"];
     updatedAt: number;
     requirements: HistoricalRequirement[];
+    requirementMessages?: HistoricalRequirementMessage[];
     checkpoint: SessionCheckpoint;
 };
 
@@ -312,6 +437,8 @@ export type WorkflowState = {
     nextRequirementNumber: number;
     nextCheckpointNumber: number;
     nextRawNumber: number;
+    nextRequirementMessageNumber: number;
+    nextPlanItemNumber: number;
     nextTaskNumber: number;
     activePhaseId?: string;
     activeTaskId?: string;
@@ -323,10 +450,18 @@ export type WorkflowState = {
     operationByCallId: Record<string, string>;
     itemPhaseByKey: Record<string, string>;
     requirements: Record<string, RequirementRecord>;
+    requirementMessages: Record<string, RequirementMessageRecord>;
     requirementBySourceRef: Record<string, string>;
     phases: Record<string, PhaseRecord>;
     checkpoints: Record<string, WorkflowCheckpoint>;
     rawArchive: Record<string, RawArchiveIndexRecord>;
+    archiveSessionId?: string;
+    phaseMessages: Record<string, PhaseMessageRecord>;
+    phaseBoundaryCandidate?: {
+        phaseId: string;
+        reason: string;
+        createdAt: number;
+    };
     tasks: Record<string, TaskRecord>;
     historian: HistorianState;
     projectMemoryLoadedAt?: number;
@@ -339,6 +474,7 @@ export type WorkflowState = {
 export type WorkflowOptions = {
     enabled: boolean;
     targetContextRatio: number;
+    models?: Record<string, { targetRatio?: number; targetContextRatio?: number }>;
     phaseGc: boolean;
     sessionGc: boolean;
     rereadAfterPhase: boolean;
