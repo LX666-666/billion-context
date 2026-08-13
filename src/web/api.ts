@@ -17,6 +17,7 @@ import {
 import { log } from "../logger.js";
 import { validateHttpProxy } from "../upstream-proxy.js";
 import type { WorkflowOptions } from "../workflow/types.js";
+import { applyCodexConfig, getCodexConfigStatus, restoreCodexConfig } from "./codex-config.js";
 
 type ConfigShape = Record<string, unknown> & {
     providers?: Record<string, unknown>;
@@ -247,6 +248,44 @@ export function readUpstreamSettings(): { mode: UpstreamProxyMode; proxy?: strin
         mode: parseUpstreamProxyMode(config.upstreamProxyMode ?? (proxy ? "manual" : undefined)),
         ...(proxy ? { proxy } : {}),
     };
+}
+
+export async function handleCodexConfig(
+    req: IncomingMessage,
+    res: ServerResponse,
+    defaultTargetBaseUrl: string,
+): Promise<void> {
+    try {
+        if (req.method === "GET") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify(getCodexConfigStatus()));
+            return;
+        }
+        const raw = await readJsonBody(req);
+        const body = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+        const action = body.action;
+        if (action === "apply") {
+            const target = typeof body.targetBaseUrl === "string" && body.targetBaseUrl.trim()
+                ? body.targetBaseUrl.trim()
+                : defaultTargetBaseUrl;
+            const status = applyCodexConfig(target);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, ...status }));
+            return;
+        }
+        if (action === "restore") {
+            const result = restoreCodexConfig();
+            if (result.conflict) {
+                return sendError(res, 409, "Codex 配置已被外部修改，未恢复以保护用户改动");
+            }
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, ...result, ...getCodexConfigStatus() }));
+            return;
+        }
+        return sendError(res, 400, "action must be apply or restore");
+    } catch (error) {
+        return sendError(res, 500, String(error instanceof Error ? error.message : error));
+    }
 }
 
 function atomicWriteConfig(config: ConfigShape): void {

@@ -42,6 +42,7 @@ import {
     renderUI,
     handleConfigGet,
     handleConfigPut,
+    handleCodexConfig,
     publicWorkflowOptions,
     handleUsageSummary,
     handleUsageTrends,
@@ -55,6 +56,7 @@ import {
     handleUsageSync,
     handleUsageSyncStatus,
 } from "./web/index.js";
+import { restoreCodexConfig } from "./web/codex-config.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { compressLoopJson, compressLoopStream } from "./compress-loop.js";
@@ -91,6 +93,8 @@ const UPSTREAM_HOP_HEADERS = new Set([
     // streamed from fetch, otherwise clients try to decompress plain bytes.
     "content-encoding",
 ]);
+
+let codexExitRestoreRegistered = false;
 
 export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.IncomingMessage): { upstream: string; rewrittenUrl: string; explicitProtocol?: "openai" | "anthropic" | "responses" } | undefined {
     // MITM mode: the request arrived over a CONNECT tunnel we terminated
@@ -224,10 +228,20 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // not lose recent compression state. SIGKILL/power loss cannot flush, but
     // debounced writes keep disk within ~500ms of in-memory state.
     let shuttingDown = false;
+    const restoreTemporaryCodexConfig = (reason: string) => {
+        try {
+            const result = restoreCodexConfig();
+            if (result.restored) log("info", `[acp-web] restored temporary Codex config on ${reason}`);
+            if (result.conflict) log("warn", `[acp-web] Codex config changed externally; left temporary backup in place`);
+        } catch (error) {
+            log("warn", `[acp-web] failed to restore temporary Codex config: ${String(error)}`);
+        }
+    };
     const shutdown = (sig: string) => {
         if (shuttingDown) return;
         shuttingDown = true;
         log("info", `${sig} received — flushing sessions…`);
+        restoreTemporaryCodexConfig(sig);
         // Stop accepting new requests BEFORE flushing, otherwise a late request
         // could mutate state after its snapshot is taken and be lost.
         // server.close(cb) waits for all keep-alive connections to drain
@@ -256,6 +270,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // raise SIGBREAK, so hook it to the same graceful-shutdown path there.
     if (process.platform === "win32") {
         process.on("SIGBREAK", () => shutdown("SIGBREAK"));
+    }
+    if (!codexExitRestoreRegistered) {
+        codexExitRestoreRegistered = true;
+        process.once("exit", () => {
+            try { restoreCodexConfig(); } catch { }
+        });
     }
     return server;
 }
@@ -350,6 +370,10 @@ async function handle(
         return;
     }
     if (req.method === "GET" && req.url === "/__bili/config") return handleConfigGet(res);
+    if ((req.method === "GET" || req.method === "POST") && req.url === "/__bili/codex-config") {
+        const origin = `http://${opts.host === "0.0.0.0" ? "localhost" : opts.host}:${opts.port}`;
+        return handleCodexConfig(req, res, `${origin}/bili/https://chatgpt.com/backend-api/codex`);
+    }
     if (req.method === "PUT" && req.url === "/__bili/config") {
         return handleConfigPut(req, res, () => {
             const fresh = loadOptions();

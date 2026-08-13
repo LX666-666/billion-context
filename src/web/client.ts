@@ -10,6 +10,50 @@ function numberValue(id){return Number(byId(id).value)}
 function stringValue(id){return byId(id).value.trim()}
 function formatTokens(value){return new Intl.NumberFormat("zh-CN",{notation:"compact",maximumFractionDigits:1}).format(Number(value)||0)}
 function percent(value){return typeof value==="number"?(value*100).toFixed(1)+"%":"—"}
+const workflowHelp={
+"workflow-enabled":"对应：整个 Cache-Aware + Workflow-Aware Context Manager 总开关。作用：关闭后 Workflow Task、Phase、Requirement、GC 基本不参与。",
+"workflow-phase-gc":"对应：Phase / Plan Boundary + Cache-aware deferred pruning。作用：Phase 完成后先生成 checkpoint 和 PENDING_DROP，再由 Scheduler 决定何时 rollover，尽量保护 prefix cache。",
+"workflow-session-gc":"对应：Project Memory / 跨任务结构化历史。作用：把 Task / Session checkpoint 留给后续工作，rollover 后注入结构化信息，不依赖完整聊天历史。",
+"workflow-reread":"对应：Phase-local baseline + patch chain。作用：旧源码事实退出后，下一 Phase 的 PATCH / WRITE 前要求重新 READ 当前仓库。",
+"workflow-archive":"对应：Archive / Retrieval invariant。作用：语义压缩的 Tool Output 离开 Active Context 前先保存可检索原文，后续仍可恢复。",
+"pruner-enabled":"对应：Pre-ingest Pruning。作用：TEST、BUILD、SEARCH、LIST、日志等输出在主 Agent 第一次看到前，先按规则压缩。",
+"workflow-target-ratio":"对应：Cache-aware Scheduler / Active Working Set。作用：不是硬上限；上下文接近这个比例后开始产生压力，Scheduler 会综合决定是否回收或 rollover。",
+"workflow-rollover-min":"对应：Deferred GC / 保护 Cache。作用：待回收内容太少时不值得重写 Prompt，避免为了少量垃圾破坏 prefix cache。",
+"workflow-memory-max":"对应：Structured Memory budget。作用：rollover 后最多重新注入给主 Agent 的结构化历史 token 数。",
+"workflow-project-sessions":"对应：Project Memory。作用：限制跨任务可参考的旧 Session 数，避免历史无限增长。",
+"pruner-min":"对应：Pre-ingest Pruning。作用：Tool Output 达到这个 token 阈值后才值得做规则剪枝。",
+"cheap-enabled":"对应：Pre-ingest Pruning 第二层。作用：规则压缩仍然无效的大型 Tool Output，才交给便宜模型处理。",
+"cheap-endpoint":"对应：Cheap Pruner 的 OpenAI-compatible 接口。作用：指定第二层压缩请求发往哪里。",
+"cheap-model":"对应：Cheap Pruner 的执行模型。作用：选择用于压缩大型 Tool Output 的低成本模型，不负责工程决策。",
+"cheap-api-key":"对应：Cheap Pruner 的鉴权凭据。作用：为兼容接口提供 API Key；留空表示保留当前已保存的 Key。",
+"cheap-clear-key":"对应：Cheap Pruner 的凭据管理。作用：明确勾选后删除已经保存的 API Key。",
+"cheap-min":"对应：Cheap Pruner 触发阈值。作用：规则处理后仍达到这个 token 数，才调用便宜模型。",
+"cheap-max":"对应：Cheap Pruner 输出预算。作用：限制便宜模型生成的压缩结果大小。",
+"cheap-timeout":"对应：Cheap Pruner 的可靠性边界。作用：模型请求超过这个时间就放弃该层，不阻塞主流程。",
+"historian-enabled":"对应：Session / Project Memory 的可选叙事层。作用：只用结构化 checkpoint 生成长期项目叙事，不覆盖确定性事实。",
+"historian-endpoint":"对应：Historian 的 OpenAI-compatible 接口。作用：指定叙事生成请求发往哪里。",
+"historian-model":"对应：Historian 的执行模型。作用：选择把 checkpoint 整理成项目叙事的模型。",
+"historian-api-key":"对应：Historian 的鉴权凭据。作用：为兼容接口提供 API Key；留空表示保留当前已保存的 Key。",
+"historian-clear-key":"对应：Historian 的凭据管理。作用：明确勾选后删除已经保存的 API Key。",
+"historian-input":"对应：Project Memory budget。作用：限制一次提供给 Historian 的 checkpoint 数据量。",
+"historian-output":"对应：Historian 输出预算。作用：限制生成的长期项目叙事大小。",
+"historian-timeout":"对应：Historian 的可靠性边界。作用：生成超时后保留确定性 checkpoint，不让叙事层阻塞流程。",
+"repo-enabled":"对应：Repository = Source of Truth。作用：追踪 repo root、HEAD、文件版本、READ 和 mutation，让源码事实以当前仓库为准。",
+"repo-enforce":"对应：Repo Bridge 强一致性。作用：Phase 后文件 stale 时，未重新 READ 就不能继续把旧 Context 当事实进行修改。",
+"repo-root":"对应：Repo Bridge 工作区边界。作用：留空自动发现当前项目；填写后只在指定工作区内追踪和校验文件。",
+"repo-hash-max":"对应：Repo Bridge 实现参数。作用：控制最多对多大的文件计算内容 hash，更大的文件使用文件状态信息。",
+"repo-timeout":"对应：Repo Bridge 实现参数。作用：限制 Git 探测最长等待时间，不改变一致性规则本身。",
+"cache-hit":"对应：Cache-aware deferred pruning。作用：缓存命中率高时提高 rollover 成本，尽量不破坏已有 prefix cache。",
+"cache-growth":"对应：Cache-aware Scheduler。作用：单轮 Context 快速膨胀时提高 GC 压力，避免工作集失控。",
+"cache-step":"对应：Projected next work。作用：估算下一步 Plan 工作会增加多少 token。",
+"cache-max-next":"对应：Projected next work。作用：限制未来工作量预测的上限，避免预测值无限放大。",
+"cache-debug-window":"对应：Debug-aware retention。作用：最近处于 FAIL → PATCH → TEST 循环时保留更多证据，不急着 GC。",
+"cache-rewrite":"对应：Cache-aware deferred pruning。作用：衡量现在重写 Prompt、损失 Cache 的代价；值越高越倾向延后 rollover。"
+};
+function installWorkflowHelp(){for(const [id,text] of Object.entries(workflowHelp)){const node=byId(id);if(!node)continue;const host=node.closest(".toggle")||node.closest(".field");if(!host||host.querySelector(".info-tip"))continue;const tip=document.createElement("button");tip.type="button";tip.className="info-tip";tip.setAttribute("aria-label","说明");tip.dataset.tooltip=text;if(host.classList.contains("field")){const label=host.querySelector("label");label?.append(tip)}else{host.append(tip)}}}
+function renderCodexStatus(status){const node=byId("codex-config-status");const card=byId("codex-chatgpt-card");if(!node||!card)return;node.className="badge"+(status.active?" ok":status.conflict?" err":"");node.textContent=status.active?"已接入 bili":status.conflict?"配置有冲突":"双击启用";card.classList.toggle("codex-active",Boolean(status.active));card.classList.toggle("codex-conflict",Boolean(status.conflict));card.setAttribute("aria-pressed",String(Boolean(status.active)))}
+async function loadCodexStatus(){try{renderCodexStatus(await json("/__bili/codex-config"))}catch(error){toast(String(error),true)}}
+async function toggleCodexConfig(){const card=byId("codex-chatgpt-card");if(!card||card.dataset.busy==="1")return;card.dataset.busy="1";card.classList.add("is-busy");try{const status=await json("/__bili/codex-config");if(status.conflict){toast("Codex 配置已被外部修改，请先处理备份文件",true);return}const action=status.active?"restore":"apply";const result=await json("/__bili/codex-config",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({action})});renderCodexStatus(result);toast(action==="apply"?"Codex 已接入 bili，双击可恢复原配置":"Codex 已恢复原配置")}catch(error){toast(String(error),true)}finally{delete card.dataset.busy;card.classList.remove("is-busy")}}
 function showPage(name){document.querySelectorAll(".page").forEach((node)=>node.classList.toggle("active",node.id==="page-"+name));document.querySelectorAll(".nav button").forEach((node)=>node.classList.toggle("active",node.dataset.page===name));if(name==="sessions")loadSessions();if(name==="upstream"){loadUpstream();loadOverrides()}if(name==="context"){loadConfig();loadWorkflowStatus()}}
 document.querySelectorAll(".nav button").forEach((button)=>button.addEventListener("click",()=>showPage(button.dataset.page)));
 function modelStatus(id,config){const node=byId(id);const enabled=Boolean(config&&config.enabled);node.className="badge"+(enabled?" ok":"");node.textContent=enabled?((config.model||"已启用")+(config.apiKeyConfigured?" · Key 已配置":" · 无 Key")):"未启用"}
@@ -28,7 +72,9 @@ async function saveWorkflow(){const button=byId("save-workflow");busy(button,tru
 function schedulerClass(action){return action==="ROLLOVER"?"scheduler-rollover":action==="DEFER"?"scheduler-defer":"scheduler-idle"}
 async function loadWorkflowStatus(){try{const data=await json("/__bili/stats");const sessions=data.sessions||[];const totals=sessions.reduce((result,item)=>{const metrics=(item.workflow&&item.workflow.metrics)||{};result.saved+=(metrics.preIngestSavedTokens||0);result.rollovers+=(metrics.rollovers||0);result.guards+=(metrics.repoGuardBlocks||0);result.stale+=(metrics.staleFiles||0);result.historian+=(metrics.historianRuns||0);result.historianFailures+=(metrics.historianFailures||0);return result},{saved:0,rollovers:0,guards:0,stale:0,historian:0,historianFailures:0});byId("workflow-runtime-summary").innerHTML='<div class="metric"><span>已加载会话</span><strong>'+escapeHtml(sessions.length)+'</strong></div><div class="metric"><span>Pre-ingest 节省</span><strong>'+escapeHtml(formatTokens(totals.saved))+'</strong></div><div class="metric"><span>Rollovers</span><strong>'+escapeHtml(totals.rollovers)+'</strong></div><div class="metric"><span>Repo Guard 阻止</span><strong>'+escapeHtml(totals.guards)+'</strong></div><div class="metric"><span>Stale 文件</span><strong>'+escapeHtml(totals.stale)+'</strong></div><div class="metric"><span>Historian</span><strong>'+escapeHtml(totals.historian)+' / '+escapeHtml(totals.historianFailures)+'</strong></div>';const visibleSessions=sessions.slice().sort((left,right)=>String(right.lastSeen).localeCompare(String(left.lastSeen))).slice(0,8);let rows=visibleSessions.map((item)=>{const workflow=item.workflow||{};const repo=workflow.repository||{};const cache=workflow.cache||{};const scheduler=workflow.scheduler||{};const metrics=workflow.metrics||{};const repoLabel=repo.root||repo.remote||workflow.projectId||"—";const head=repo.head?String(repo.head).slice(0,10):"—";const dirty=repo.dirty===true?"dirty":repo.dirty===false?"clean":"unknown";const action=scheduler.action||"IDLE";const reason=Array.isArray(scheduler.reasons)&&scheduler.reasons.length?scheduler.reasons.slice(0,2).join(" · "):"no decision yet";return '<tr><td><div class="mono">'+escapeHtml(repoLabel)+'</div><div class="status">'+escapeHtml(head+" · "+dirty)+'</div></td><td><div>'+escapeHtml(workflow.currentTask||"—")+'</div><div class="status">'+escapeHtml(workflow.currentPhase||"—")+'</div></td><td>'+escapeHtml(percent(cache.cacheHitRatio))+'<div class="status">growth '+escapeHtml(percent(cache.contextGrowthRate))+'</div></td><td class="'+schedulerClass(action)+'">'+escapeHtml(action)+'<div class="status">score '+escapeHtml(scheduler.score??"—")+' · '+escapeHtml(reason)+'</div></td><td>'+escapeHtml(formatTokens(metrics.preIngestSavedTokens||0))+'</td><td>'+escapeHtml((repo.unresolvedGuards||0)+" pending")+'<div class="status">'+escapeHtml((repo.staleFiles||0)+" stale")+'</div></td></tr>'}).join("");if(sessions.length>visibleSessions.length)rows+='<tr><td colspan="6" class="status">另有 '+escapeHtml(sessions.length-visibleSessions.length)+' 个较早会话未显示。</td></tr>';byId("workflow-sessions-body").innerHTML=rows||'<tr><td colspan="6">暂无活动会话；设置仍可保存并热更新。</td></tr>'}catch(error){byId("workflow-runtime-summary").innerHTML='<div class="metric"><span>状态读取失败</span><strong class="scheduler-rollover">'+escapeHtml(String(error))+'</strong></div>'}}
 async function refreshWorkflow(){const button=byId("refresh-workflow");busy(button,true,"刷新中…");try{await Promise.all([loadConfig(),loadWorkflowStatus()]);toast("Workflow 状态已刷新")}catch(error){toast(String(error),true)}finally{busy(button,false)}}
-document.querySelectorAll(".copy-btn").forEach((btn)=>btn.addEventListener("click",async()=>{busy(btn,true,"复制中…");try{await navigator.clipboard.writeText(btn.dataset.copy||"");toast("已复制")}catch(error){toast(String(error),true)}finally{busy(btn,false)}}));
+installWorkflowHelp();document.querySelectorAll(".info-tip").forEach((button)=>{button.addEventListener("mouseenter",()=>button.classList.add("show-tip"));button.addEventListener("mouseleave",()=>button.classList.remove("show-tip"));button.addEventListener("focus",()=>button.classList.add("show-tip"));button.addEventListener("blur",()=>button.classList.remove("show-tip"));button.addEventListener("click",(event)=>{event.preventDefault();event.stopPropagation()})});
+document.querySelectorAll(".copy-btn").forEach((btn)=>btn.addEventListener("click",async(event)=>{event.stopPropagation();busy(btn,true,"复制中…");try{await navigator.clipboard.writeText(btn.dataset.copy||"");toast("已复制")}catch(error){toast(String(error),true)}finally{busy(btn,false)}}));
+byId("codex-chatgpt-card").addEventListener("dblclick",(event)=>{if(event.target.closest("button,input,a"))return;toggleCodexConfig()});byId("codex-chatgpt-card").addEventListener("keydown",(event)=>{if(event.key==="Enter"&&event.ctrlKey)toggleCodexConfig()});loadCodexStatus();
 byId("save-upstream").addEventListener("click",saveUpstream);byId("test-upstream").addEventListener("click",testUpstream);byId("save-providers").addEventListener("click",saveProviders);byId("save-overrides").addEventListener("click",saveOverrides);byId("refresh-sessions").addEventListener("click",refreshSessions);byId("save-workflow").addEventListener("click",saveWorkflow);byId("refresh-workflow").addEventListener("click",refreshWorkflow);
 Promise.all([loadConfig(),loadUpstream()]).catch((error)=>toast(String(error),true));setInterval(()=>{if(byId("page-sessions").classList.contains("active"))loadSessions().catch(()=>{});if(byId("page-context").classList.contains("active"))loadWorkflowStatus().catch(()=>{})},5000);
 `;

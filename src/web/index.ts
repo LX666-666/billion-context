@@ -6,6 +6,7 @@ import { renderPage } from "./page.js";
 export {
     handleConfigGet,
     handleConfigPut,
+    handleCodexConfig,
     readProviders,
     readUpstreamSettings,
     publicWorkflowOptions,
