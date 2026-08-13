@@ -3,6 +3,7 @@ import { archiveRequirementMessage, verifyRawArchiveCommit } from "./archive.js"
 import { assignRequirementToTask } from "./project-memory.js";
 import type { RequirementMessageRecord, RequirementRecord, RequirementStatus, WorkflowState } from "./types.js";
 import { estimateTokensFast } from "acp-kernel";
+import { isWorkflowMessage } from "./workflow-item.js";
 
 function importance(detail: string): RequirementRecord["importance"] {
     return /(?:\b(?:must|never|critical|forbid|required|do not)\b|禁止|必须|绝不|不能|不得|优先级)/i.test(detail)
@@ -31,11 +32,6 @@ function terminal(status: RequirementStatus): boolean {
     return status === "SATISFIED" || status === "SUPERSEDED" || status === "CANCELLED" || status === "HISTORICAL";
 }
 
-function sourceIsWorkflow(message: BiliMessage): boolean {
-    const raw = message.rawResponsesItem;
-    return Boolean(raw && typeof raw === "object" && (raw as Record<string, unknown>).bili_workflow === true);
-}
-
 export function requirementMessageForSource(state: WorkflowState, sourceRef: string): RequirementMessageRecord | undefined {
     const requirementId = state.requirementBySourceRef[sourceRef];
     const requirement = requirementId ? state.requirements[requirementId] : undefined;
@@ -45,7 +41,7 @@ export function requirementMessageForSource(state: WorkflowState, sourceRef: str
 export function syncRequirements(state: WorkflowState, messages: BiliMessage[], sessionId?: string): RequirementRecord[] {
     const created: RequirementRecord[] = [];
     for (const message of messages) {
-        if (message.role !== "user" || message.contentType !== "text" || !message.text?.trim() || sourceIsWorkflow(message)) continue;
+        if (message.role !== "user" || message.contentType !== "text" || !message.text?.trim() || isWorkflowMessage(message)) continue;
         if (state.requirementBySourceRef[message.id]) continue;
         const messageId = `REQMSG-${String(state.nextRequirementMessageNumber++).padStart(5, "0")}`;
         const details = atomicDetails(message.text);
@@ -104,7 +100,10 @@ export function refreshRequirementHistory(state: WorkflowState): number {
             || !requirements.every((requirement) => terminal(requirement.status))) continue;
         for (const requirement of requirements) {
             requirement.historicalDetail = requirement.detail;
-            if (requirement.status !== "HISTORICAL") requirement.status = "HISTORICAL";
+            if (requirement.status !== "HISTORICAL") {
+                requirement.resolvedStatus = requirement.status;
+                requirement.status = "HISTORICAL";
+            }
         }
         message.lifecycle = "PENDING_DROP";
         message.historicalAt = Date.now();

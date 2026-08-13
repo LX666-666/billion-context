@@ -77,6 +77,7 @@ export type RequirementRecord = {
     preserveRaw: boolean;
     rawRef?: string;
     historicalDetail?: string;
+    resolvedStatus?: Exclude<RequirementStatus, "HISTORICAL">;
     taskId?: string;
     createdAt: number;
 };
@@ -213,6 +214,7 @@ export type PhaseArchive = {
     operations: PhaseArchiveOperationEntry[];
     changedFiles: string[];
     checkpointRef?: string;
+    checkpoint?: WorkflowCheckpoint;
     checksum: string;
 };
 
@@ -348,7 +350,7 @@ export type RepoBridgeState = {
 
 export type HistoricalRequirement = Pick<
     RequirementRecord,
-    "id" | "detail" | "status" | "importance" | "sourceRefs" | "preserveRaw" | "rawRef" | "taskId"
+    "id" | "detail" | "status" | "resolvedStatus" | "importance" | "sourceRefs" | "preserveRaw" | "rawRef" | "taskId"
 >;
 
 export type HistorianNarrative = {
@@ -440,11 +442,14 @@ export type WorkflowState = {
     nextRequirementMessageNumber: number;
     nextPlanItemNumber: number;
     nextTaskNumber: number;
+    checkpointRetryPhaseId?: string;
+    checkpointRetryCount: number;
     activePhaseId?: string;
     activeTaskId?: string;
     activePlan?: PlanRecord;
     sessionStatus: "ACTIVE" | "COMPLETE_CANDIDATE";
     seenPlanCallIds: string[];
+    seenBoundarySignalRefs: string[];
     checkpointQueue: string[];
     operations: Record<string, OperationRecord>;
     operationByCallId: Record<string, string>;
@@ -461,6 +466,9 @@ export type WorkflowState = {
         phaseId: string;
         reason: string;
         createdAt: number;
+        sourceMessageRef: string;
+        sourceRevision: number;
+        consumedAt?: number;
     };
     tasks: Record<string, TaskRecord>;
     historian: HistorianState;

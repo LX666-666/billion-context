@@ -365,6 +365,12 @@ export function archivePhase(
             return { committed: false, error: phase.archiveError };
         }
     }
+    const effectiveCheckpoint = checkpoint ?? (phase.checkpointId ? state.checkpoints[phase.checkpointId] : undefined);
+    if (phase.checkpointId && !effectiveCheckpoint) {
+        phase.archiveStatus = "FAILED";
+        phase.archiveError = `checkpoint snapshot is missing for ${phase.checkpointId}`;
+        return { committed: false, error: phase.archiveError };
+    }
     const base = {
         phaseId,
         ...(phase.taskId ? { taskId: phase.taskId } : {}),
@@ -374,8 +380,9 @@ export function archivePhase(
         ...(checkpoint?.checkpointId ? { checkpointId: checkpoint.checkpointId } : phase.checkpointId ? { checkpointId: phase.checkpointId } : {}),
         messageEntries,
         operations: operations.map((operation) => operationEntry(state, operation, messages)),
-        changedFiles: checkpoint?.changedFiles ?? [],
-        ...(checkpoint?.checkpointId ? { checkpointRef: checkpoint.checkpointId } : phase.checkpointId ? { checkpointRef: phase.checkpointId } : {}),
+        changedFiles: effectiveCheckpoint?.changedFiles ?? [],
+        ...(effectiveCheckpoint?.checkpointId ? { checkpointRef: effectiveCheckpoint.checkpointId } : phase.checkpointId ? { checkpointRef: phase.checkpointId } : {}),
+        ...(effectiveCheckpoint ? { checkpoint: structuredClone(effectiveCheckpoint) } : {}),
     };
     const checksum = rawChecksum(JSON.stringify(base));
     const archive: PhaseArchive = { ...base, checksum };
@@ -444,6 +451,12 @@ export function verifyPhaseArchiveRecoverability(
         }
     }
     if (parsed.phaseId !== phaseId || !Array.isArray(parsed.messageEntries) || !Array.isArray(parsed.operations)) return false;
+    if (parsed.checkpointId !== undefined || parsed.checkpointRef !== undefined || parsed.checkpoint !== undefined) {
+        if (!parsed.checkpoint
+            || parsed.checkpointId !== parsed.checkpointRef
+            || parsed.checkpoint.checkpointId !== parsed.checkpointRef
+            || parsed.checkpoint.phaseId !== phaseId) return false;
+    }
     for (const message of parsed.messageEntries) {
         if (message.payload === undefined && !message.payloadRef) {
             const operation = message.operationId ? state.operations[message.operationId] : undefined;

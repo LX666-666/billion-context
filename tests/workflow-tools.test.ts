@@ -106,6 +106,7 @@ test("Codex checkpoint refreshes the same internal sampling request after phase 
         globalThis.fetch = previousFetch;
     }
     assert.ok(forwarded);
+    assert.doesNotMatch(JSON.stringify(forwarded), /bili_workflow/);
     const forwardedText = JSON.stringify(forwarded.input);
     assert.doesNotMatch(forwardedText, /work-call|workflow-checkpoint-request|Internal phase reasoning/);
     assert.match(forwardedText, /workflow-memory/);

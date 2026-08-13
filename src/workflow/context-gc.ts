@@ -7,6 +7,24 @@ import { archiveHistoricalRequirements, refreshRequirementHistory } from "./requ
 import { markPhaseMessagesPendingDrop, recomputeWorkflowMetrics } from "./state.js";
 import type { OperationRecord, WorkflowCheckpoint, WorkflowOptions, WorkflowState } from "./types.js";
 
+const MAX_CHECKPOINT_AUTO_RETRIES = 1;
+
+export function beginWorkflowTurn(state: WorkflowState): void {
+    state.checkpointRetryPhaseId = undefined;
+    state.checkpointRetryCount = 0;
+}
+
+function rejectCheckpoint(state: WorkflowState, phaseId: string, message: string): string {
+    if (state.checkpointRetryPhaseId !== phaseId) {
+        state.checkpointRetryPhaseId = phaseId;
+        state.checkpointRetryCount = 0;
+    }
+    state.checkpointRetryCount++;
+    state.metrics.checkpointRejects++;
+    state.metrics.checkpointRetries++;
+    return message;
+}
+
 function strings(value: unknown): string[] {
     return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
@@ -151,15 +169,11 @@ export function recordWorkflowCheckpoint(
         .filter((operation): operation is OperationRecord => Boolean(operation));
     const activeOperations = phaseOperations.filter((operation) => operation.lifecycle === "ACTIVE");
     if (activeOperations.length > 0) {
-        state.metrics.checkpointRejects++;
-        state.metrics.checkpointRetries++;
-        return `[workflow_checkpoint REJECTED: undelivered operation(s): ${activeOperations.map((operation) => operation.opId).join(", ")}]`;
+        return rejectCheckpoint(state, phaseId, `[workflow_checkpoint REJECTED: undelivered operation(s): ${activeOperations.map((operation) => operation.opId).join(", ")}]`);
     }
     const validation = validateCheckpointAgainstPhase(checkpoint, phase, phaseOperations, state);
     if (!validation.valid) {
-        state.metrics.checkpointRejects++;
-        state.metrics.checkpointRetries++;
-        return `[workflow_checkpoint REJECTED: ${validation.errors.join("; ")}]`;
+        return rejectCheckpoint(state, phaseId, `[workflow_checkpoint REJECTED: ${validation.errors.join("; ")}]`);
     }
     const previousOperationLifecycles = new Map(
         phaseOperations.map((operation) => [operation.opId, operation.lifecycle] as const),
@@ -189,14 +203,18 @@ export function recordWorkflowCheckpoint(
             if (lifecycle) message.lifecycle = lifecycle;
         }
         recomputeWorkflowMetrics(state);
-        state.metrics.checkpointRejects++;
-        return `[workflow_checkpoint REJECTED: phase archive failed — ${archive.error ?? "unknown archive error"}]`;
+        return rejectCheckpoint(state, phaseId, `[workflow_checkpoint REJECTED: phase archive failed — ${archive.error ?? "unknown archive error"}]`);
     }
     state.nextCheckpointNumber++;
+    state.checkpointRetryPhaseId = undefined;
+    state.checkpointRetryCount = 0;
     state.checkpoints[checkpointId] = checkpoint;
     for (const update of updates) {
         const requirement = state.requirements[update.id];
         if (!requirement) continue;
+        if (update.status === "HISTORICAL" && requirement.status !== "HISTORICAL") {
+            requirement.resolvedStatus = requirement.status;
+        }
         requirement.status = update.status;
         if (update.supersededBy) requirement.supersededBy = update.supersededBy;
     }
@@ -215,6 +233,7 @@ export function recordWorkflowCheckpoint(
 export function checkpointRequest(state: WorkflowState, textProtocol: boolean): string | undefined {
     const phaseId = state.checkpointQueue[0];
     if (!phaseId) return undefined;
+    if (state.checkpointRetryPhaseId === phaseId && state.checkpointRetryCount > MAX_CHECKPOINT_AUTO_RETRIES) return undefined;
     const phase = state.phases[phaseId];
     if (!phase) return undefined;
     const operationSummary = phase.operationIds.map((opId) => {

@@ -46,6 +46,7 @@ import { DEFAULT_WORKFLOW_OPTIONS, type WorkflowOptions } from "./workflow/types
 import { saveProjectMemory } from "./workflow/project-memory.js";
 import { preprocessResponsesWorkflow } from "./workflow/responses-preprocessor.js";
 import type { ResponsesRequestBody } from "./responses.js";
+import { buildWorkflowResultText } from "./workflow/workflow-item.js";
 
 /** Text-protocol mode: the host (OpenAI Codex code_mode) cannot coexist with
  *  a declared `tools` array, so compression is triggered by a text marker the
@@ -209,6 +210,7 @@ async function refreshWorkflowRequest(
         ctx.workflowOptions ?? DEFAULT_WORKFLOW_OPTIONS,
         ctx.config.modelContextLimit,
         textProtocol,
+        true,
     );
     requestBody.input = refreshed.body.input;
 }
@@ -536,8 +538,16 @@ export async function compressLoopResponsesJson(
             const result = executeProxyTool(call.name, args, ctx);
             ctx.log(`[acp-proxy: responses JSON ${call.name} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
             inputItems.push(textProtocol
-                ? { type: "message", role: "user", content: buildVisibilityMarker(call.name, result) }
+                ? { type: "message", role: "assistant", content: buildWorkflowResultText(call.name, buildVisibilityMarker(call.name, result)) }
                 : { type: "function_call_output", call_id: call.callId, output: result });
+        }
+        const checkpointRetryExhausted = proxyCalls.some((call) =>
+            call.name === "workflow_checkpoint"
+            && ctx.session.workflow.checkpointRetryCount > 1,
+        );
+        if (checkpointRetryExhausted) {
+            replaceResponsesJsonText(output.textParts, extracted.clean);
+            return current;
         }
         requestBody.input = inputItems;
         if (proxyCalls.some((call) => call.name === "workflow_checkpoint" || call.name === "workflow_mark")) {
@@ -824,8 +834,16 @@ export async function* compressLoopResponsesStream(
                 "utf8",
             );
             inputItems.push(textProtocol
-                ? { type: "message", role: "user", content: buildVisibilityMarker(fc.name, result) }
+                ? { type: "message", role: "assistant", content: buildWorkflowResultText(fc.name, buildVisibilityMarker(fc.name, result)) }
                 : { type: "function_call_output", call_id: fc.callId || `call_${Date.now()}`, output: result });
+        }
+        const checkpointRetryExhausted = proxyCalls.some((call) =>
+            call.name === "workflow_checkpoint"
+            && ctx.session.workflow.checkpointRetryCount > 1,
+        );
+        if (checkpointRetryExhausted) {
+            yield Buffer.from(buildCompleted(responseObj), "utf8");
+            return;
         }
 
         requestBody.input = inputItems;
@@ -855,12 +873,8 @@ export async function* compressLoopResponsesStream(
         }
 
         upstream = resp.body as ReadableStream<Uint8Array>;
-        // Clear the PREVIOUS round's timer before overwriting — otherwise the
-        // fetch-timeout timer from rounds 1..N-1 leaks (each would self-fire
-        // harmlessly after 10min, but the handles accumulate in the event loop
-        // over a long session). Only the final round's timer is cleared by the
-        // outer finally.
-        if (activeClearTimer) activeClearTimer();
+        // The previous round's timer is cleared when its stream reader exits;
+        // retain this round's timer so the reader-finally block can clear it.
         activeClearTimer = clearTimer;
     }
 }

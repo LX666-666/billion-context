@@ -14,6 +14,7 @@ import {
 import { applyRanges } from "../stream.js";
 import { resolveDecompress } from "../decompress-shared.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
+import { buildWorkflowResultText } from "../workflow/workflow-item.js";
 import { fetchWithTimeout } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
 import { log as loggerLog } from "../logger.js";
@@ -290,9 +291,9 @@ export async function* runCompressLoop(
                     if (ctx.textProtocol) {
                         coreMessages.push({
                             id: `acp_loop_r${round}_marker_${pr.callId}`,
-                            role: "user",
+                            role: "assistant",
                             contentType: "text",
-                            text: buildVisibilityMarker(pr.name, pr.result),
+                            text: buildWorkflowResultText(pr.name, buildVisibilityMarker(pr.name, pr.result)),
                         });
                     } else {
                         coreMessages.push({
@@ -326,7 +327,12 @@ export async function* runCompressLoop(
                 yield adapter.emitToolCall(tc);
             }
 
-            const reRequest = proxyResults.length > 0 && realCalls === 0;
+            const checkpointRetryExhausted = proxyResults.some((result) =>
+                result.name === "workflow_checkpoint"
+                && result.result.includes("workflow_checkpoint REJECTED")
+                && ctx.session.workflow.checkpointRetryCount > 1,
+            );
+            const reRequest = proxyResults.length > 0 && realCalls === 0 && !checkpointRetryExhausted;
             if (!reRequest) {
                 yield adapter.emitCompletion({ finishReason, usage });
                 return;

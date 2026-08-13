@@ -152,7 +152,10 @@ export function responsesToCore(body: ResponsesRequestBody): ResponsesProjection
                     continue;
                 } else if (message.role === "user" || (message.role === "assistant" && text)) {
                     const role = message.role;
-                    coreId = clusters.next(deriveMessageId(role, "text", text));
+                    const stableItemId = typeof (message as Record<string, unknown>).id === "string"
+                        ? String((message as Record<string, unknown>).id)
+                        : undefined;
+                    coreId = clusters.next(deriveMessageId(role, "text", stableItemId ? `item:${stableItemId}` : text));
                     const imageUrl = Array.isArray(message.content)
                         ? message.content.find((part) => part.type === "input_image" && typeof part.image_url === "string")?.image_url
                         : undefined;

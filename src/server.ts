@@ -1297,6 +1297,7 @@ async function forward(
                                 workflowOptions,
                                 config.modelContextLimit,
                                 textProtocol,
+                                true,
                             );
                             const projection = responsesToCore(refreshed.body);
                             attachOperationMessageRefs(prepared.session.workflow, projection.msgs);

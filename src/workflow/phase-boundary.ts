@@ -2,14 +2,19 @@ import type { BiliMessage } from "../bili-message.js";
 import { ensureActivePhase } from "./state.js";
 import { markPhaseRepositoryStateStale } from "./repo-bridge.js";
 import type { OperationRecord, WorkflowState } from "./types.js";
+import { isWorkflowMessage } from "./workflow-item.js";
 
-const EXPLICIT_SWITCH = /(?:now|next|switch|move on|another|different)\b|(?:已经|已完成|完成了|现在|接下来).*(?:改|处理|开始|另一个|下一个)|(?:this|that)\s+(?:is\s+)?(?:done|complete|finished)/i;
+const EXPLICIT_SWITCH = /(?:\b(?:switch|move on to|move to|start(?: work)? on|begin(?: work)? on|focus on|work on)\s+(?:the\s+)?(?:next|another|new|different|phase|task|step|target)\b|\b(?:next|another|new|different)\s+(?:phase|task|step|target|feature)\b|\b(?:this|that)\s+(?:is\s+)?(?:done|complete|finished)\b\s*(?:,|;|and|so)?\s*(?:now|next|then|let'?s|we can|I will)?\s*(?:switch|move|start|work|focus)\b)|(?:这个好了|这部分好了|已经完成|已完成|完成了).{0,40}(?:现在|接下来|然后).{0,20}(?:改|处理|开始|切换|转到|另一个|下一个)/i;
 
 function closeCandidate(state: WorkflowState): void {
     const phaseId = state.activePhaseId;
     if (!phaseId) return;
     const phase = state.phases[phaseId];
     if (!phase || phase.status !== "ACTIVE") return;
+    const candidate = state.phaseBoundaryCandidate;
+    if (candidate && typeof candidate.sourceMessageRef === "string" && candidate.sourceMessageRef.startsWith("operation:")) {
+        candidate.consumedAt = Date.now();
+    }
     phase.status = "CHECKPOINT_PENDING";
     phase.completedAt = Date.now();
     markPhaseRepositoryStateStale(state, phaseId);
@@ -38,14 +43,17 @@ function targetChanged(state: WorkflowState, phaseId: string, operation: Operati
 
 export function observePhaseBoundaryFallback(state: WorkflowState, messages: BiliMessage[]): void {
     if (state.activePlan?.items.some((item) => item.status === "in_progress") || !state.activePhaseId) return;
-    const explicit = messages.slice(-8).some((message) =>
-        (message.role === "user" || message.role === "assistant") && EXPLICIT_SWITCH.test(message.text ?? ""),
+    const latestUser = [...messages].reverse().find((message) =>
+        message.role === "user" && message.contentType === "text" && !isWorkflowMessage(message),
     );
-    if (!explicit) return;
+    if (!latestUser || !EXPLICIT_SWITCH.test(latestUser.text ?? "") || state.seenBoundarySignalRefs.includes(latestUser.id)) return;
+    state.seenBoundarySignalRefs.push(latestUser.id);
     state.phaseBoundaryCandidate = {
         phaseId: state.activePhaseId,
         reason: "explicit objective switch without update_plan",
         createdAt: Date.now(),
+        sourceMessageRef: latestUser.id,
+        sourceRevision: state.activePlan?.revision ?? 0,
     };
 }
 
@@ -58,6 +66,8 @@ export function beforeFallbackOperation(state: WorkflowState, operation: Operati
             phaseId: activePhaseId,
             reason: "new target after successful validation without update_plan",
             createdAt: Date.now(),
+            sourceMessageRef: `operation:${operation.opId}`,
+            sourceRevision: state.activePlan?.revision ?? 0,
         };
         return;
     }

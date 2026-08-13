@@ -197,6 +197,9 @@ function buildContentSse(
 }
 
 export function buildVisibilityMarker(toolName: string, result: string): string {
+    if (toolName === "workflow_checkpoint" && result.includes("workflow_checkpoint REJECTED")) {
+        return "\n❌ [ACP] workflow_checkpoint rejected; evidence is incomplete. Retry once with the missing evidence, then continue in a later turn.\n";
+    }
     const lines = result.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
     const failed = lines.some((l) =>
         l.includes("FAILED")

@@ -1,6 +1,6 @@
 import type { BiliMessage } from "../bili-message.js";
 import type { Session } from "../session.js";
-import { applyDeferredRollover, checkpointRequest, workflowMemory } from "./context-gc.js";
+import { applyDeferredRollover, beginWorkflowTurn, checkpointRequest, workflowMemory } from "./context-gc.js";
 import { attachOperationMessageRefs, operationForCall, trackOperationCall, updateOperationResult } from "./operation-tracker.js";
 import { applyPlanUpdate } from "./plan-tracker.js";
 import { hydrateProjectMemory, runCheapHistorian } from "./project-memory.js";
@@ -12,6 +12,7 @@ import { capturePhaseMessage } from "./state.js";
 import { observePhaseBoundaryFallback } from "./phase-boundary.js";
 import type { WorkflowOptions } from "./types.js";
 import { observeRepositoryOperation, refreshRepoBridge, repoProjectId, repositoryGuardMessage, workspaceRootFromText } from "./repo-bridge.js";
+import { isWorkflowMessage } from "./workflow-item.js";
 
 export async function preprocessCoreWorkflow(
     messages: BiliMessage[],
@@ -22,6 +23,7 @@ export async function preprocessCoreWorkflow(
     model?: string,
 ): Promise<BiliMessage[]> {
     if (!options.enabled) return messages;
+    beginWorkflowTurn(session.workflow);
     const workspace = workspaceRootFromText([
         workspaceSource,
         ...messages.filter((message) => message.role === "system").map((message) => message.text),
@@ -42,7 +44,7 @@ export async function preprocessCoreWorkflow(
     for (const message of messages) {
         const operation = message.toolCallId ? operationForCall(session.workflow, message.toolCallId) : undefined;
         const phaseId = operation?.phaseId ?? session.workflow.itemPhaseByKey[message.id] ?? session.workflow.activePhaseId;
-        if (!phaseId || message.rawResponsesItem && typeof message.rawResponsesItem === "object" && (message.rawResponsesItem as Record<string, unknown>).bili_workflow === true) continue;
+        if (!phaseId || isWorkflowMessage(message)) continue;
         session.workflow.itemPhaseByKey[message.id] = phaseId;
         const requirementId = message.role === "user" ? session.workflow.requirementBySourceRef[message.id] : undefined;
         const requirementMessageId = requirementId ? session.workflow.requirements[requirementId]?.messageId : undefined;
@@ -60,7 +62,7 @@ export async function preprocessCoreWorkflow(
         ? session.workflow.phases[session.workflow.activePhaseId]?.objective
         : undefined;
     const requirementHint = Object.values(session.workflow.requirements)
-        .filter((requirement) => requirement.status === "ACTIVE")
+        .filter((requirement) => requirement.status === "ACTIVE" || requirement.status === "ACTIVE_CURRENT" || requirement.status === "ACTIVE_STABLE")
         .map((requirement) => `${requirement.id}: ${requirement.detail}`)
         .join("\n")
         .slice(0, 4_000);
@@ -105,7 +107,6 @@ export async function preprocessCoreWorkflow(
             role: "user",
             contentType: "text",
             text: tail,
-            rawResponsesItem: { bili_workflow: true },
         });
     }
     attachOperationMessageRefs(session.workflow, filtered);

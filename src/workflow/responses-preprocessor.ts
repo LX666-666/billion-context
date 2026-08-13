@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { responsesToCore, type ResponsesRequestBody, type ResponseInputItem } from "../responses.js";
 import type { Session } from "../session.js";
-import { applyDeferredRollover, checkpointRequest, workflowMemory } from "./context-gc.js";
+import { applyDeferredRollover, beginWorkflowTurn, checkpointRequest, workflowMemory } from "./context-gc.js";
 import { operationForCall, trackOperationCall, updateOperationResult } from "./operation-tracker.js";
 import { applyPlanUpdate } from "./plan-tracker.js";
 import { pruneWithCheapModel } from "./pruner/cheap-model.js";
@@ -18,6 +18,7 @@ import {
     workspaceRootFromText,
 } from "./repo-bridge.js";
 import type { WorkflowOptions } from "./types.js";
+import { isWorkflowItem, isWorkflowResultItem, isWorkflowResultText, isWorkflowText, stripWorkflowMarker } from "./workflow-item.js";
 
 export type WorkflowPreprocessResult = {
     body: ResponsesRequestBody;
@@ -89,7 +90,7 @@ function projectIdentity(candidate: string | undefined): string | undefined {
 }
 
 function workflowItem(content: string): ResponseInputItem {
-    return { type: "message", role: "user", content, bili_workflow: true };
+    return { type: "message", role: "user", content };
 }
 
 function messageIdentity(item: ResponseInputItem): string | undefined {
@@ -164,10 +165,19 @@ function responseItemText(item: ResponseInputItem): string {
             : JSON.stringify(item);
 }
 
-function requirementMessageForResponseItem(state: Session["workflow"], item: ResponseInputItem): string | undefined {
+function requirementMessageForResponseItem(
+    state: Session["workflow"],
+    item: ResponseInputItem,
+    itemKey: string | undefined,
+    sourceRefsByItemKey: Map<string, string>,
+): string | undefined {
     if (item.type !== "message" || (item as Record<string, unknown>).role !== "user") return undefined;
-    const text = responseItemText(item);
-    return Object.values(state.requirementMessages).find((message) => message.detail === text)?.messageId;
+    const record = item as Record<string, unknown>;
+    const sourceRef = (itemKey ? sourceRefsByItemKey.get(itemKey) : undefined)
+        ?? (typeof record.id === "string" ? record.id : undefined);
+    if (!sourceRef) return undefined;
+    const requirementId = state.requirementBySourceRef[sourceRef];
+    return requirementId ? state.requirements[requirementId]?.messageId : undefined;
 }
 
 function phaseItemCanDrop(item: ResponseInputItem): boolean {
@@ -187,12 +197,24 @@ export async function preprocessResponsesWorkflow(
     options: WorkflowOptions,
     modelContextLimit: number,
     textProtocol: boolean,
+    internalRefresh = false,
 ): Promise<WorkflowPreprocessResult> {
-    if (!options.enabled || !Array.isArray(body.input)) {
+    if (!Array.isArray(body.input)) {
         return { body, prunedOperations: 0, archivedOperations: 0 };
     }
+    const internalResults = body.input
+        .filter((item) => isWorkflowResultItem(item))
+        .map(stripWorkflowMarker);
+    const clientInput = body.input
+        .filter((item) => !isWorkflowItem(item) || (item.type === "message" && (item as Record<string, unknown>).role === "user" && (item as Record<string, unknown>).bili_workflow === true && !isWorkflowText(responseItemText(item)) && !isWorkflowResultText(responseItemText(item))))
+        .map(stripWorkflowMarker);
+    const cleanBody = { ...body, input: clientInput };
+    if (!internalRefresh) beginWorkflowTurn(session.workflow);
+    if (!options.enabled) {
+        return { body: cleanBody, prunedOperations: 0, archivedOperations: 0 };
+    }
     const state = session.workflow;
-    const workspace = workspaceRoot(body) ?? options.repoBridge.workspaceRoot;
+    const workspace = workspaceRoot(cleanBody) ?? options.repoBridge.workspaceRoot;
     refreshRepoBridge(state, workspace, options.repoBridge);
     const metadataProjectKey = typeof body.metadata?.projectKey === "string" ? body.metadata.projectKey : undefined;
     state.projectId ??= options.projectKey?.trim()
@@ -200,15 +222,27 @@ export async function preprocessResponsesWorkflow(
         || repoProjectId(state.repoBridge)
         || projectIdentity(workspace);
     if (options.sessionGc) hydrateProjectMemory(session.id, state, options.memory.maxProjectSessions);
-    const workflowProjection = responsesToCore(body);
+    const workflowProjection = responsesToCore(cleanBody);
     syncRequirements(state, workflowProjection.msgs, session.id);
     observePhaseBoundaryFallback(state, workflowProjection.msgs);
     if (options.sessionGc) await runCheapHistorian(session.id, state, options);
     applyDeferredRollover(state, options, session.stats.lastInputTokens || session.stats.contextTokens, modelContextLimit, body.model);
-    const sourceInput = body.input.filter((item) => {
-        return !((item as Record<string, unknown>).bili_workflow === true);
-    });
+    const sourceInput = clientInput;
     const itemKeys = responseItemKeys(sourceInput);
+    const sourceRefsByItemKey = new Map<string, string>();
+    const sourceIndexesByItem = new Map<ResponseInputItem, number[]>();
+    sourceInput.forEach((item, index) => {
+        const indexes = sourceIndexesByItem.get(item) ?? [];
+        indexes.push(index);
+        sourceIndexesByItem.set(item, indexes);
+    });
+    workflowProjection.layout.forEach((slot, index) => {
+        const sourceIndexes = sourceIndexesByItem.get(slot.original);
+        const sourceIndex = sourceIndexes?.shift();
+        if (slot.coreId && sourceIndex !== undefined && itemKeys[sourceIndex]) {
+            sourceRefsByItemKey.set(itemKeys[sourceIndex], slot.coreId);
+        }
+    });
     let prunedOperations = 0;
     for (let index = 0; index < sourceInput.length; index++) {
         const item = sourceInput[index];
@@ -241,7 +275,7 @@ export async function preprocessResponsesWorkflow(
             : output
               ? operationForCall(state, output.callId)
               : undefined;
-        const requirementMessageId = requirementMessageForResponseItem(state, item);
+        const requirementMessageId = requirementMessageForResponseItem(state, item, itemKey, sourceRefsByItemKey);
         capturePhaseMessage(state, {
             phaseId,
             messageRef: itemKey,
@@ -258,7 +292,7 @@ export async function preprocessResponsesWorkflow(
     }
     const phaseObjective = state.activePhaseId ? state.phases[state.activePhaseId]?.objective : undefined;
     const requirementHint = Object.values(state.requirements)
-        .filter((requirement) => requirement.status === "ACTIVE")
+        .filter((requirement) => requirement.status === "ACTIVE" || requirement.status === "ACTIVE_CURRENT" || requirement.status === "ACTIVE_STABLE")
         .map((requirement) => `${requirement.id}: ${requirement.detail}`)
         .join("\n")
         .slice(0, 4_000);
@@ -287,7 +321,8 @@ export async function preprocessResponsesWorkflow(
         if (call && operationArchived(session, call.callId)) return false;
         const output = outputFields(item);
         if (output && operationArchived(session, output.callId)) return false;
-        if (requirementMessageForResponseItem(state, item) && state.requirementMessages[requirementMessageForResponseItem(state, item) ?? ""]?.lifecycle === "ARCHIVED") return false;
+        const requirementMessageId = requirementMessageForResponseItem(state, item, itemKeys[index], sourceRefsByItemKey);
+        if (requirementMessageId && state.requirementMessages[requirementMessageId]?.lifecycle === "ARCHIVED") return false;
         const phaseId = state.itemPhaseByKey[itemKeys[index]];
         const phaseMessage = state.phaseMessages[itemKeys[index]];
         return !(phaseId
@@ -296,13 +331,14 @@ export async function preprocessResponsesWorkflow(
             && phaseItemCanDrop(item));
     });
     const memory = workflowMemory(state, options.rereadAfterPhase, options.memory.maxInjectedTokens);
+    filtered.push(...internalResults.slice(-8));
     if (memory) filtered.push(workflowItem(memory));
     const request = checkpointRequest(state, textProtocol);
     if (request) filtered.push(workflowItem(request));
     const guard = repositoryGuardMessage(state);
     if (guard) filtered.push(workflowItem(guard));
     return {
-        body: { ...body, input: filtered },
+        body: { ...cleanBody, input: filtered.map(stripWorkflowMarker) },
         prunedOperations,
         archivedOperations: Object.values(state.operations).filter((operation) => operation.lifecycle === "ARCHIVED").length,
     };

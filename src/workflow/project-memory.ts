@@ -57,6 +57,7 @@ function historicalRequirement(requirement: RequirementRecord): HistoricalRequir
         sourceRefs: [...requirement.sourceRefs],
         preserveRaw: requirement.preserveRaw,
         ...(requirement.rawRef ? { rawRef: requirement.rawRef } : {}),
+        ...(requirement.resolvedStatus ? { resolvedStatus: requirement.resolvedStatus } : {}),
         ...(requirement.taskId ? { taskId: requirement.taskId } : {}),
     };
 }
@@ -295,7 +296,7 @@ export function hydrateProjectMemory(sessionId: string, state: WorkflowState, ma
 function mergeRequirements(values: HistoricalRequirement[]): HistoricalRequirement[] {
     const seen = new Set<string>();
     return values.filter((requirement) => {
-        const key = JSON.stringify([requirement.detail, requirement.status, requirement.rawRef, requirement.sourceRefs]);
+        const key = JSON.stringify([requirement.detail, requirement.status, requirement.resolvedStatus, requirement.rawRef, requirement.sourceRefs]);
         if (seen.has(key)) return false;
         seen.add(key);
         return true;

@@ -94,6 +94,27 @@ test("Responses workflow prunes before ingest, archives raw output, checkpoints 
     assert.equal(Object.values(session.workflow.rawArchive).filter((record) => record.type === "TEST").length, 1);
     assert.equal(session.workflow.checkpointQueue.length, 1);
     assert.match(JSON.stringify(second.body.input), /workflow-checkpoint-request/);
+    assert.doesNotMatch(JSON.stringify(second.body), /bili_workflow/);
+    const checkpointItems = (second.body.input as ResponseInputItem[]).filter((item) =>
+        item.type === "message"
+        && item.role === "user"
+        && typeof item.content === "string"
+        && item.content.includes("<workflow-checkpoint-request>"),
+    );
+    assert.equal(checkpointItems.length, 1);
+    assert.deepEqual(Object.keys(checkpointItems[0]).sort(), ["content", "role", "type"]);
+    const requirementCount = Object.keys(session.workflow.requirements).length;
+    const phaseMessageCount = Object.keys(session.workflow.phaseMessages).length;
+    const replayed = await preprocessResponsesWorkflow(second.body, session, options, 400_000, true);
+    assert.equal(Object.keys(session.workflow.requirements).length, requirementCount);
+    assert.equal(Object.keys(session.workflow.phaseMessages).length, phaseMessageCount);
+    assert.equal((replayed.body.input as ResponseInputItem[]).filter((item) =>
+        item.type === "message"
+        && item.role === "user"
+        && typeof item.content === "string"
+        && item.content.includes("<workflow-checkpoint-request>"),
+    ).length, 1);
+    assert.doesNotMatch(JSON.stringify(replayed.body), /bili_workflow/);
     session.workflow.requirements["REQ-00001"] = {
         id: "REQ-00001",
         sourceRefs: ["m00001"],
@@ -143,10 +164,25 @@ test("Codex source reads stay intact and workflow tail messages never enter the 
 
     syncRequirements(session.workflow, [
         { id: "m00001", role: "user", contentType: "text", text: "Never discard my exact constraints." },
-        { id: "m00002", role: "user", contentType: "text", text: "internal", rawResponsesItem: { bili_workflow: true } },
+        { id: "m00002", role: "user", contentType: "text", text: "<workflow-memory>internal</workflow-memory>" },
     ]);
     assert.equal(Object.keys(session.workflow.requirements).length, 1);
     assert.equal(Object.values(session.workflow.requirements)[0].importance, "CRITICAL");
+});
+
+test("Responses workflow strips legacy private markers even when context management is disabled", async () => {
+    const session = makeSession();
+    const result = await preprocessResponsesWorkflow({
+        model: "gpt-5-codex",
+        input: [
+            { type: "message", role: "user", content: "Keep this client message.", bili_workflow: true },
+            { type: "message", role: "user", content: "<workflow-checkpoint-request>stale</workflow-checkpoint-request>", bili_workflow: true },
+        ],
+    }, session, { ...DEFAULT_WORKFLOW_OPTIONS, enabled: false }, 400_000, true);
+    assert.deepEqual(result.body.input, [
+        { type: "message", role: "user", content: "Keep this client message." },
+    ]);
+    assert.doesNotMatch(JSON.stringify(result.body), /bili_workflow|workflow-checkpoint-request/);
 });
 
 test("Codex cwd metadata derives the same project identity across path separator and case changes", async () => {

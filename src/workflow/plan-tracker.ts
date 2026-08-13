@@ -58,6 +58,9 @@ function assignStableIds(state: WorkflowState, previous: PlanStepRecord[] | unde
         index: previousItems.indexOf(item),
         planItemId: item.planItemId ?? `planItem${String(state.nextPlanItemNumber++).padStart(5, "0")}`,
     }));
+    for (const candidate of previousWithIds) {
+        if (!candidate.item.planItemId) candidate.item.planItemId = candidate.planItemId;
+    }
     const score = (candidate: typeof previousWithIds[number], item: PlanStepRecord, index: number): number => {
         const exact = normalized(candidate.item.step) === normalized(item.step);
         const lexical = similarity(candidate.item.step, item.step);
@@ -83,7 +86,10 @@ function assignStableIds(state: WorkflowState, previous: PlanStepRecord[] | unde
         const lexical = similarity(pair.candidate.item.step, next[pair.nextIndex]?.step ?? "");
         const statusTransition = (pair.candidate.item.status === "in_progress" && next[pair.nextIndex]?.status === "completed")
             || (pair.candidate.item.status === "pending" && next[pair.nextIndex]?.status === "in_progress");
-        if (!exact && lexical < 0.2 && !(statusTransition && pair.candidate.index === pair.nextIndex)) continue;
+        const sameActivePosition = pair.candidate.item.status === "in_progress"
+            && next[pair.nextIndex]?.status === "in_progress"
+            && pair.candidate.index === pair.nextIndex;
+        if (!exact && lexical < 0.2 && !sameActivePosition && !(statusTransition && pair.candidate.index === pair.nextIndex)) continue;
         matchedNext.add(pair.nextIndex);
         matchedPrevious.add(pair.candidate.planItemId);
         ids.set(pair.nextIndex, pair.candidate.planItemId);
@@ -118,9 +124,16 @@ export function applyPlanUpdate(state: WorkflowState, callId: string, argumentsT
     const currentActive = nextItems.find((item) => item.status === "in_progress");
     const oldActiveProgressed = previousActive.some((item) => {
         const mapped = item.planItemId ? nextById.get(item.planItemId) : undefined;
-        return !mapped || mapped.status !== "in_progress";
+        if (mapped?.status === "completed") return true;
+        if (mapped) return false;
+        const previousIndex = previousItems.indexOf(item);
+        const nextActiveIndex = nextItems.findIndex((candidate) => candidate.status === "in_progress");
+        return nextActiveIndex > previousIndex;
     });
-    const crossedBoundary = previousActive.length > 0 && oldActiveProgressed && Boolean(currentActive);
+    const previousCompletedCount = previousItems.filter((item) => item.status === "completed").length;
+    const nextCompletedCount = nextItems.filter((item) => item.status === "completed").length;
+    const completedCountIncreased = nextCompletedCount > previousCompletedCount;
+    const crossedBoundary = previousActive.length > 0 && Boolean(currentActive) && (completedCountIncreased || oldActiveProgressed);
     if (crossedBoundary) closeActivePhase(state);
     if (!state.activePhaseId && currentActive) ensureActivePhase(state, currentActive.step).planItemId = currentActive.planItemId;
     if (state.activePhaseId && currentActive) {
