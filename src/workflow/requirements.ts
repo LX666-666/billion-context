@@ -4,11 +4,16 @@ import { assignRequirementToTask } from "./project-memory.js";
 import type { RequirementMessageRecord, RequirementRecord, RequirementStatus, WorkflowState } from "./types.js";
 import { estimateTokensFast } from "acp-kernel";
 import { isWorkflowMessage } from "./workflow-item.js";
+import { classifyRequirementProvenance, isRealUserRequirement } from "./provenance.js";
 
 function importance(detail: string): RequirementRecord["importance"] {
     return /(?:\b(?:must|never|critical|forbid|required|do not)\b|禁止|必须|绝不|不能|不得|优先级)/i.test(detail)
         ? "CRITICAL"
         : "NORMAL";
+}
+
+function cleanRequirementText(value: string): string {
+    return value.replace(/^\s*\x3cacp\b[^>]*\x3e[^<]+\x3c\/acp\x3e\s*/i, "").trim();
 }
 
 function atomicDetails(detail: string): string[] {
@@ -42,16 +47,20 @@ export function syncRequirements(state: WorkflowState, messages: BiliMessage[], 
     const created: RequirementRecord[] = [];
     for (const message of messages) {
         if (message.role !== "user" || message.contentType !== "text" || !message.text?.trim() || isWorkflowMessage(message)) continue;
+        const detailText = cleanRequirementText(message.text);
+        if (!detailText) continue;
+        const provenance = message.provenance ?? classifyRequirementProvenance(detailText);
+        if (!isRealUserRequirement(provenance)) continue;
         if (state.requirementBySourceRef[message.id]) continue;
         const messageId = `REQMSG-${String(state.nextRequirementMessageNumber++).padStart(5, "0")}`;
-        const details = atomicDetails(message.text);
+        const details = atomicDetails(detailText);
         const requirementIds: string[] = [];
         const messageRecord: RequirementMessageRecord = {
             messageId,
             sourceRefs: [message.id],
-            detail: message.text,
+            detail: detailText,
             requirementIds,
-            tokenSize: estimateTokensFast(message.text),
+            tokenSize: estimateTokensFast(detailText),
             lifecycle: "ACTIVE",
             createdAt: Date.now(),
         };
@@ -66,6 +75,7 @@ export function syncRequirements(state: WorkflowState, messages: BiliMessage[], 
                 detail,
                 status: details.length > 1 ? "ACTIVE_CURRENT" : "ACTIVE",
                 importance: importance(detail),
+                provenance,
                 preserveRaw: true,
                 createdAt: Date.now(),
             };
@@ -74,11 +84,12 @@ export function syncRequirements(state: WorkflowState, messages: BiliMessage[], 
             state.requirementBySourceRef[message.id] ??= id;
             assignRequirementToTask(state, requirement, sessionId);
             created.push(requirement);
+            state.requirementLedgerVersion++;
         }
         if (sessionId && requirementIds.length > 0) {
             const first = state.requirements[requirementIds[0]];
             if (first) {
-                const rawRef = archiveRequirementMessage(sessionId, state, first, message.text);
+                const rawRef = archiveRequirementMessage(sessionId, state, first, detailText);
                 if (rawRef) {
                     messageRecord.rawRef = rawRef;
                     for (const id of requirementIds) state.requirements[id].rawRef = rawRef;

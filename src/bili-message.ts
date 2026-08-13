@@ -19,11 +19,14 @@
  */
 
 import type { CoreMessage } from "acp-kernel";
+import type { RequirementProvenance } from "./workflow/types.js";
 
 /** A message that carries its original protocol block(s) verbatim, so the
  *  reverse conversion can reconstruct losslessly. Every field is optional —
  *  plain text messages (the common case) have none set. */
 export interface BiliMessage extends CoreMessage {
+    /** Workflow provenance for user-like Responses items. */
+    provenance?: RequirementProvenance;
     /** Anthropic: the original content block for an image or a structured
      *  tool_result. Restored verbatim by coreToAnthropic. */
     rawAnthropicBlock?: unknown;

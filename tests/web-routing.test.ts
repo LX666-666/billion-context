@@ -169,7 +169,7 @@ test("workflow model settings hot-reload while API keys remain write-only", asyn
                         },
                     },
                     archive: { semanticRaw: true },
-                    repoBridge: { enabled: true, enforceReread: true, hashMaxBytes: 2_000_000, gitTimeoutMs: 3_000 },
+                    repoBridge: { enabled: true, requireRereadAfterPhase: true, hashMaxBytes: 2_000_000, gitTimeoutMs: 3_000 },
                     cache: {
                         protectCacheHitRatio: 0.7,
                         highGrowthRate: 0.2,

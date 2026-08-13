@@ -3,6 +3,7 @@ import type { Session } from "../session.js";
 import { applyDeferredRollover, beginWorkflowTurn, checkpointRequest, workflowMemory } from "./context-gc.js";
 import { attachOperationMessageRefs, operationForCall, trackOperationCall, updateOperationResult } from "./operation-tracker.js";
 import { applyPlanUpdate } from "./plan-tracker.js";
+import { extractCodexUpdatePlanCalls } from "./codex-code-mode.js";
 import { hydrateProjectMemory, runCheapHistorian } from "./project-memory.js";
 import { pruneWithCheapModel } from "./pruner/cheap-model.js";
 import { commitSemanticPrune, pruneToolOutput } from "./pruner/index.js";
@@ -38,7 +39,12 @@ export async function preprocessCoreWorkflow(
     for (const message of messages) {
         if (message.contentType !== "tool-call" || !message.toolCallId) continue;
         const operation = trackOperationCall(session.workflow, message.toolCallId, message.toolName ?? "unknown", message.text ?? "{}");
-        if (message.toolName === "update_plan") applyPlanUpdate(session.workflow, message.toolCallId, message.text ?? "{}");
+        const planCalls = message.toolName === "update_plan"
+            ? [{ callId: message.toolCallId, argumentsText: message.text ?? "{}" }]
+            : (message.toolName === "exec" || message.toolName === "codex")
+              ? extractCodexUpdatePlanCalls(message.toolCallId, message.text ?? "")
+              : [];
+        for (const planCall of planCalls) applyPlanUpdate(session.workflow, planCall.callId, planCall.argumentsText);
         observeRepositoryOperation(session.workflow, operation, options.repoBridge);
     }
     for (const message of messages) {

@@ -3,6 +3,7 @@ import { ClusterCounter, deriveMessageId } from "./message-id.js";
 import type { ConversationIdentity } from "./session-id.js";
 import { hashId } from "./util.js";
 import { parseDataUrl, type BiliMessage } from "./bili-message.js";
+import { classifyRequirementProvenance } from "./workflow/provenance.js";
 
 export type ResponseContentPart =
     | { type: "input_text"; text: string; [key: string]: unknown }
@@ -105,6 +106,10 @@ function messageContent(content: string | ResponseContentPart[]): string {
     return typeof content === "string" ? content : content.map(partText).join("\n");
 }
 
+function acpTagReference(text: string): string | undefined {
+    return /^\s*\x3cacp\b[^>]*\x3e([^<]+)\x3c\/acp\x3e/i.exec(text)?.[1]?.trim();
+}
+
 export function responsesToCore(body: ResponsesRequestBody): ResponsesProjection {
     const msgs: BiliMessage[] = [];
     const systemParts: string[] = [];
@@ -154,7 +159,7 @@ export function responsesToCore(body: ResponsesRequestBody): ResponsesProjection
                     const role = message.role;
                     const stableItemId = typeof (message as Record<string, unknown>).id === "string"
                         ? String((message as Record<string, unknown>).id)
-                        : undefined;
+                        : acpTagReference(text);
                     coreId = clusters.next(deriveMessageId(role, "text", stableItemId ? `item:${stableItemId}` : text));
                     const imageUrl = Array.isArray(message.content)
                         ? message.content.find((part) => part.type === "input_image" && typeof part.image_url === "string")?.image_url
@@ -165,6 +170,7 @@ export function responsesToCore(body: ResponsesRequestBody): ResponsesProjection
                         role,
                         contentType: "text",
                         text,
+                        ...(role === "user" ? { provenance: classifyRequirementProvenance(text) } : {}),
                         rawResponsesItem: item,
                         ...(image ? { imageMediaType: image.mediaType, imageBase64: image.base64 } : {}),
                     });

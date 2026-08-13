@@ -166,6 +166,12 @@ export function refreshRepoBridge(
     state: WorkflowState,
     workspaceCandidate: string | undefined,
     options: WorkflowOptions["repoBridge"],
+    metadata?: {
+        repoRoot?: string;
+        remoteIdentity?: string;
+        head?: string;
+        dirty?: boolean;
+    },
 ): RepoBridgeState {
     const repo = state.repoBridge;
     if (!options.enabled) return repo;
@@ -174,7 +180,9 @@ export function refreshRepoBridge(
         repo.lastError = workspaceCandidate || options.workspaceRoot ? "workspace root is unavailable" : undefined;
         return repo;
     }
-    const repoRoot = normalizeRoot(git(workspaceRoot, ["rev-parse", "--show-toplevel"], options.gitTimeoutMs)) ?? workspaceRoot;
+    const repoRoot = normalizeRoot(metadata?.repoRoot)
+        ?? normalizeRoot(git(workspaceRoot, ["rev-parse", "--show-toplevel"], options.gitTimeoutMs))
+        ?? workspaceRoot;
     const previousRoot = repo.repoRoot;
     const previousHead = repo.head;
     repo.refreshGeneration++;
@@ -184,10 +192,10 @@ export function refreshRepoBridge(
     }
     repo.workspaceRoot = workspaceRoot;
     repo.repoRoot = repoRoot;
-    repo.remoteIdentity = sanitizedRemote(git(repoRoot, ["remote", "get-url", "origin"], options.gitTimeoutMs));
-    repo.head = git(repoRoot, ["rev-parse", "HEAD"], options.gitTimeoutMs);
+    repo.remoteIdentity = sanitizedRemote(git(repoRoot, ["remote", "get-url", "origin"], options.gitTimeoutMs)) ?? sanitizedRemote(metadata?.remoteIdentity);
+    repo.head = git(repoRoot, ["rev-parse", "HEAD"], options.gitTimeoutMs) ?? metadata?.head;
     const status = git(repoRoot, ["status", "--porcelain=v1"], options.gitTimeoutMs);
-    repo.dirty = status !== undefined ? status.length > 0 : undefined;
+    repo.dirty = status !== undefined ? status.length > 0 : metadata?.dirty;
     repo.observedAt = Date.now();
     repo.lastError = undefined;
     state.metrics.repoRefreshes++;
@@ -257,7 +265,7 @@ function blockOperation(state: WorkflowState, operation: OperationRecord, paths:
         createdAt: Date.now(),
     };
     state.repoBridge.violations.push(violation);
-    operation.repositoryGuard = { status: "BLOCKED_REREAD", paths, reason, violationId };
+    operation.repositoryGuard = { status: "POST_MUTATION_REREAD_REQUIRED", paths, reason, violationId };
     state.metrics.repoGuardBlocks++;
 }
 
@@ -304,7 +312,7 @@ export function observeRepositoryOperation(
             && previous.staleGeneration !== undefined
             && previous.staleGeneration < state.repoBridge.refreshGeneration;
     });
-    if (options.enforceReread && (crossedBoundary || staleFromEarlierRefresh)) {
+    if (options.requireRereadAfterPhase && (crossedBoundary || staleFromEarlierRefresh)) {
         if (paths.length === 0 || unresolvedTargets > 0) {
             blockOperation(state, operation, [], "mutation target is outside the repository or could not be resolved safely");
         } else {
@@ -320,7 +328,7 @@ export function observeRepositoryOperation(
     }
     for (const snapshot of observed) {
         const previous = storedFile(state.repoBridge, snapshot.relativePath);
-        const blocked = operation.repositoryGuard?.status === "BLOCKED_REREAD";
+        const blocked = operation.repositoryGuard?.status === "POST_MUTATION_REREAD_REQUIRED";
         storeFile(state.repoBridge, {
             ...snapshot,
             ...(previous?.lastReadPhaseId ? { lastReadPhaseId: previous.lastReadPhaseId } : {}),
@@ -356,7 +364,7 @@ export function repositoryGuardMessage(state: WorkflowState): string | undefined
     });
     const staleLines = stale.map((file) => `${file.relativePath}: ${file.staleReason ?? "STALE"}`);
     const heading = violations.length > 0
-        ? "CONTEXT BLOCKED until repository re-read."
+        ? "STALE CONTEXT REQUIRES REREAD before trusting repository facts."
         : "REPOSITORY SNAPSHOTS ARE STALE; re-read before mutation.";
     return `<workflow-repository-guard>\n${heading}\n${[...violationLines, ...staleLines].join("\n")}\nA local mutation may already have run, so do not infer success or current code from old context. Re-read the current repository files, then validate before any further PATCH or WRITE. Repository state wins over requirements, checkpoints, summaries, READ baselines, and patch history as a source of code facts.\n</workflow-repository-guard>`;
 }
@@ -365,6 +373,6 @@ export function guardedOperationOutput(operation: OperationRecord): string | und
     const guard = operation.repositoryGuard;
     if (!guard) return undefined;
     const targets = guard.paths.length > 0 ? guard.paths.join(", ") : "unresolved mutation target";
-    const status = guard.status === "BLOCKED_REREAD" ? "REPOSITORY REREAD REQUIRED" : "REPOSITORY SNAPSHOT REFRESHED";
+    const status = guard.status === "POST_MUTATION_REREAD_REQUIRED" ? "POST-MUTATION REREAD REQUIRED" : "REPOSITORY SNAPSHOT REFRESHED";
     return `[${status}]\nop_id: ${operation.opId}\nviolation: ${guard.violationId}\ntargets: ${targets}\nreason: ${guard.reason}\nThe local tool may already have changed the filesystem. Its original output remains withheld from active context; use the current repository snapshot and fresh validation as the source of truth.`;
 }

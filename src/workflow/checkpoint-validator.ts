@@ -124,17 +124,6 @@ export function validateCheckpointAgainstPhase(
             errors.push(`${operation.opId} is CRITICAL but is absent from criticalRefs/keepRefs`);
         }
     }
-    const phaseRequirements = Object.values(state.requirements).filter((requirement) =>
-        phase.taskId === undefined || requirement.taskId === phase.taskId,
-    );
-    for (const requirement of phaseRequirements) {
-        if (requirement.importance !== "CRITICAL") continue;
-        const updated = checkpoint.requirementUpdates.some((update) => update.id === requirement.id);
-        if (!updated && !referenced.has(requirement.id) && !(requirement.rawRef && referenced.has(requirement.rawRef))) {
-            errors.push(`${requirement.id} is CRITICAL but is absent from checkpoint evidence`);
-        }
-    }
-
     const stale = Object.values(state.repoBridge.files).filter((file) =>
         file.stale
         && (file.lastReadPhaseId === phase.phaseId || file.lastMutationPhaseId === phase.phaseId)

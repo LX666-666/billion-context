@@ -101,13 +101,13 @@ test("Repo Bridge enforces multi-file re-read after a phase and permanently with
     applyPlanUpdate(state, "plan-2", plan([["implement", "completed"], ["verify", "in_progress"]]));
     const blocked = trackOperationCall(state, "patch-2", "apply_patch", JSON.stringify({ patch: "*** Begin Patch\n*** Update File: src/a.ts\n@@\n-a\n+A\n*** Update File: src/b.ts\n@@\n-b\n+B\n*** End Patch" }));
     observeRepositoryOperation(state, blocked, DEFAULT_WORKFLOW_OPTIONS.repoBridge);
-    assert.equal(blocked.repositoryGuard?.status, "BLOCKED_REREAD");
+    assert.equal(blocked.repositoryGuard?.status, "POST_MUTATION_REREAD_REQUIRED");
     assert.deepEqual(blocked.repositoryGuard?.paths.sort(), ["src/a.ts", "src/b.ts"]);
-    assert.match(guardedOperationOutput(blocked) ?? "", /REPOSITORY REREAD REQUIRED/);
+    assert.match(guardedOperationOutput(blocked) ?? "", /POST-MUTATION REREAD REQUIRED/);
 
     const rereadA = trackOperationCall(state, "reread-a", "shell_command", JSON.stringify({ command: "Get-Content -LiteralPath 'src/a.ts'", workdir: root }));
     observeRepositoryOperation(state, rereadA, DEFAULT_WORKFLOW_OPTIONS.repoBridge);
-    assert.equal(blocked.repositoryGuard?.status, "BLOCKED_REREAD");
+    assert.equal(blocked.repositoryGuard?.status, "POST_MUTATION_REREAD_REQUIRED");
     const rereadB = trackOperationCall(state, "reread-b", "shell_command", JSON.stringify({ command: "Get-Content -LiteralPath 'src/b.ts'", workdir: root }));
     observeRepositoryOperation(state, rereadB, DEFAULT_WORKFLOW_OPTIONS.repoBridge);
     assert.equal(blocked.repositoryGuard?.status, "SATISFIED");
@@ -124,7 +124,7 @@ test("Repo Bridge enforces multi-file re-read after a phase and permanently with
 
     const outside = trackOperationCall(state, "outside-write", "write_file", JSON.stringify({ path: path.join(base, "outside.ts"), content: "unsafe" }));
     observeRepositoryOperation(state, outside, DEFAULT_WORKFLOW_OPTIONS.repoBridge);
-    assert.equal(outside.repositoryGuard?.status, "BLOCKED_REREAD");
+    assert.equal(outside.repositoryGuard?.status, "POST_MUTATION_REREAD_REQUIRED");
 });
 
 test("Repo Bridge marks external file and HEAD changes stale and blocks a later same-phase mutation", (t) => {
@@ -140,7 +140,7 @@ test("Repo Bridge marks external file and HEAD changes stale and blocks a later 
     refreshRepoBridge(state, root, DEFAULT_WORKFLOW_OPTIONS.repoBridge);
     const patch = trackOperationCall(state, "patch-after-external", "apply_patch", JSON.stringify({ patch: "*** Begin Patch\n*** Update File: src/a.ts\n@@\n-a\n+A\n*** End Patch" }));
     observeRepositoryOperation(state, patch, DEFAULT_WORKFLOW_OPTIONS.repoBridge);
-    assert.equal(patch.repositoryGuard?.status, "BLOCKED_REREAD");
+    assert.equal(patch.repositoryGuard?.status, "POST_MUTATION_REREAD_REQUIRED");
 
     const reread = trackOperationCall(state, "reread-after-external", "shell_command", JSON.stringify({ command: "Get-Content -LiteralPath 'src/a.ts'", workdir: root }));
     observeRepositoryOperation(state, reread, DEFAULT_WORKFLOW_OPTIONS.repoBridge);

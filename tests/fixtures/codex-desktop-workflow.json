@@ -1,0 +1,29 @@
+{
+  "client_metadata": {
+    "x-codex-turn-metadata": "{\"workspaces\":[\"C:\\\\workspace\\\\sample\"],\"remote\":\"https://example.invalid/acme/sample.git\",\"commit\":\"deadbeef\",\"has_changes\":true}"
+  },
+  "host_context": "<recommended_plugins>\n- Example plugin\n</recommended_plugins>\n# AGENTS.md instructions for C:\\workspace\\sample\nMUST preserve repository rules.\n<environment_context><cwd>C:\\workspace\\sample</cwd></environment_context>",
+  "goal": "/goal Read the Codex goal objective file and implement the requested workflow changes.",
+  "plans": [
+    [
+      { "step": "Inspect the repository and existing tests", "status": "in_progress" },
+      { "step": "Implement the adapter", "status": "pending" },
+      { "step": "Run validation", "status": "pending" }
+    ],
+    [
+      { "step": "Inspect the repository and existing tests", "status": "completed" },
+      { "step": "Implement the adapter", "status": "in_progress" },
+      { "step": "Run validation", "status": "pending" }
+    ],
+    [
+      { "step": "Inspect the repository and existing tests", "status": "completed" },
+      { "step": "Implement the adapter", "status": "completed" },
+      { "step": "Run validation", "status": "in_progress" }
+    ],
+    [
+      { "step": "Inspect the repository and existing tests", "status": "completed" },
+      { "step": "Implement the adapter", "status": "completed" },
+      { "step": "Run validation", "status": "completed" }
+    ]
+  ]
+}

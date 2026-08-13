@@ -4,6 +4,7 @@ import type { Session } from "../session.js";
 import { applyDeferredRollover, beginWorkflowTurn, checkpointRequest, workflowMemory } from "./context-gc.js";
 import { operationForCall, trackOperationCall, updateOperationResult } from "./operation-tracker.js";
 import { applyPlanUpdate } from "./plan-tracker.js";
+import { extractCodexUpdatePlanCalls } from "./codex-code-mode.js";
 import { pruneWithCheapModel } from "./pruner/cheap-model.js";
 import { commitSemanticPrune, pruneToolOutput } from "./pruner/index.js";
 import { hydrateProjectMemory, runCheapHistorian } from "./project-memory.js";
@@ -19,6 +20,7 @@ import {
 } from "./repo-bridge.js";
 import type { WorkflowOptions } from "./types.js";
 import { isWorkflowItem, isWorkflowResultItem, isWorkflowResultText, isWorkflowText, stripWorkflowMarker } from "./workflow-item.js";
+import { classifyRequirementProvenance, isCodexHostContext } from "./provenance.js";
 
 export type WorkflowPreprocessResult = {
     body: ResponsesRequestBody;
@@ -31,6 +33,14 @@ type CallFields = {
     name: string;
     argumentsText: string;
 };
+
+const deliveredInternalResults = new WeakMap<Session, Set<string>>();
+
+function internalResultKey(item: ResponseInputItem): string {
+    const record = item as Record<string, unknown>;
+    if (typeof record.id === "string" && record.id.trim()) return `id:${record.id}`;
+    return `body:${createHash("sha256").update(JSON.stringify(item)).digest("hex").slice(0, 24)}`;
+}
 
 function callFields(item: ResponseInputItem): CallFields | undefined {
     const record = item as Record<string, unknown>;
@@ -56,16 +66,93 @@ function outputFields(item: ResponseInputItem): { callId: string; output: string
     };
 }
 
-function workspaceRoot(body: ResponsesRequestBody): string | undefined {
+type WorkspaceHints = {
+    workspaceRoot?: string;
+    repoRoot?: string;
+    remoteIdentity?: string;
+    head?: string;
+    dirty?: boolean;
+};
+
+function parseCodexTurnMetadata(body: ResponsesRequestBody): WorkspaceHints {
+    const clientMetadata = body.client_metadata ?? body.metadata?.client_metadata;
+    if (!clientMetadata || typeof clientMetadata !== "object" || Array.isArray(clientMetadata)) return {};
+    const raw = (clientMetadata as Record<string, unknown>)["x-codex-turn-metadata"];
+    let value: unknown = raw;
+    if (typeof raw === "string") {
+        try {
+            value = JSON.parse(raw);
+        } catch {
+            return {};
+        }
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    const metadata = value as Record<string, unknown>;
+    const workspaces = Array.isArray(metadata.workspaces)
+        ? metadata.workspaces
+        : metadata.workspaces && typeof metadata.workspaces === "object"
+          ? Object.entries(metadata.workspaces as Record<string, unknown>).map(([root, details]) =>
+                details && typeof details === "object" && !Array.isArray(details)
+                    ? { root, ...(details as Record<string, unknown>) }
+                    : root,
+            )
+          : [];
+    const firstWorkspace = workspaces[0];
+    const workspaceRoot = typeof firstWorkspace === "string"
+        ? firstWorkspace
+        : firstWorkspace && typeof firstWorkspace === "object"
+          ? ["root", "workspace_root", "path", "cwd"].map((key) => (firstWorkspace as Record<string, unknown>)[key]).find((item): item is string => typeof item === "string" && Boolean(item.trim()))
+          : undefined;
+    const workspaceDetails = firstWorkspace && typeof firstWorkspace === "object" && !Array.isArray(firstWorkspace)
+        ? firstWorkspace as Record<string, unknown>
+        : {};
+    const repository = metadata.repository && typeof metadata.repository === "object" && !Array.isArray(metadata.repository)
+        ? metadata.repository as Record<string, unknown>
+        : metadata.repo && typeof metadata.repo === "object" && !Array.isArray(metadata.repo)
+          ? metadata.repo as Record<string, unknown>
+          : metadata.git && typeof metadata.git === "object" && !Array.isArray(metadata.git)
+            ? metadata.git as Record<string, unknown>
+          : { ...metadata, ...workspaceDetails };
+    const remoteIdentity = ["remote", "remote_url", "remoteUrl", "origin"].map((key) => repository[key]).find((item): item is string => typeof item === "string" && Boolean(item.trim()));
+    const head = ["commit", "head", "current_commit", "currentCommit"].map((key) => repository[key]).find((item): item is string => typeof item === "string" && Boolean(item.trim()));
+    const dirty = ["has_changes", "hasChanges", "dirty"].map((key) => repository[key]).find((item): item is boolean => typeof item === "boolean");
+    return {
+        ...(workspaceRoot ? { workspaceRoot: workspaceRoot.trim() } : {}),
+        ...(typeof metadata.repo_root === "string" ? { repoRoot: metadata.repo_root } : {}),
+        ...(remoteIdentity ? { remoteIdentity } : {}),
+        ...(head ? { head } : {}),
+        ...(dirty !== undefined ? { dirty } : {}),
+    };
+}
+
+function hostContextSources(body: ResponsesRequestBody): string[] {
+    const sources: string[] = [];
+    if (!Array.isArray(body.input)) return sources;
+    for (const item of body.input) {
+        if (item.type !== "message") continue;
+        const record = item as Record<string, unknown>;
+        const content = record.content;
+        const text = typeof content === "string"
+            ? content
+            : Array.isArray(content)
+              ? content.map((part) => part && typeof part === "object" && typeof (part as Record<string, unknown>).text === "string" ? (part as Record<string, unknown>).text as string : "").join("\n")
+              : "";
+        if ((record.role === "system" || record.role === "developer" || record.role === "user") && isCodexHostContext(text)) sources.push(text);
+    }
+    return sources;
+}
+
+function workspaceRoot(body: ResponsesRequestBody): { root?: string; hints: WorkspaceHints } {
     const metadata = body.metadata;
-    let candidate = metadata?.project_root ?? metadata?.workspace_root ?? metadata?.cwd;
+    const codexMetadata = parseCodexTurnMetadata(body);
+    let candidate = codexMetadata.workspaceRoot ?? metadata?.project_root ?? metadata?.workspace_root ?? metadata?.cwd;
     if (typeof candidate !== "string" || !candidate.trim()) {
-        const sources = [body.instructions];
+        const sources = [body.instructions, ...hostContextSources(body)];
         if (Array.isArray(body.input)) {
             for (const item of body.input) {
                 if (item.type !== "message") continue;
                 const record = item as Record<string, unknown>;
-                if (record.role !== "system" && record.role !== "developer") continue;
+                if (record.role !== "system" && record.role !== "developer" && record.role !== "user") continue;
                 const content = record.content;
                 if (typeof content === "string") {
                     sources.push(content);
@@ -80,7 +167,10 @@ function workspaceRoot(body: ResponsesRequestBody): string | undefined {
         }
         candidate = workspaceRootFromText(sources);
     }
-    return typeof candidate === "string" && candidate.trim() ? candidate.trim() : undefined;
+    return {
+        ...(typeof candidate === "string" && candidate.trim() ? { root: candidate.trim() } : {}),
+        hints: codexMetadata,
+    };
 }
 
 function projectIdentity(candidate: string | undefined): string | undefined {
@@ -106,8 +196,9 @@ function messageIdentity(item: ResponseInputItem): string | undefined {
                 return typeof value === "string" ? value : "";
             }).join("\n")
           : "";
+    const tagReference = /^\s*\x3cacp\b[^>]*\x3e([^<]+)\x3c\/acp\x3e\s*/i.exec(text)?.[1]?.trim();
     const normalized = text.replace(/^\s*\x3cacp\b[^>]*\x3e[^<]+\x3c\/acp\x3e\s*/i, "");
-    return `${String(record.role ?? "unknown")}:${createHash("sha256").update(normalized).digest("hex").slice(0, 20)}`;
+    return `${String(record.role ?? "unknown")}:${tagReference ?? createHash("sha256").update(normalized).digest("hex").slice(0, 20)}`;
 }
 
 function responseItemKeys(items: ResponseInputItem[]): string[] {
@@ -202,20 +293,35 @@ export async function preprocessResponsesWorkflow(
     if (!Array.isArray(body.input)) {
         return { body, prunedOperations: 0, archivedOperations: 0 };
     }
-    const internalResults = body.input
-        .filter((item) => isWorkflowResultItem(item))
-        .map(stripWorkflowMarker);
+    const state = session.workflow;
+    let internalResults: ResponseInputItem[] = [];
+    if (internalRefresh) {
+        const seen = deliveredInternalResults.get(session) ?? new Set<string>();
+        deliveredInternalResults.set(session, seen);
+        internalResults = body.input
+            .filter((item) => isWorkflowResultItem(item))
+            .filter((item) => {
+                const key = internalResultKey(item);
+                if (seen.has(key)) return false;
+                seen.add(key);
+                return true;
+            })
+            .map(stripWorkflowMarker);
+    }
     const clientInput = body.input
         .filter((item) => !isWorkflowItem(item) || (item.type === "message" && (item as Record<string, unknown>).role === "user" && (item as Record<string, unknown>).bili_workflow === true && !isWorkflowText(responseItemText(item)) && !isWorkflowResultText(responseItemText(item))))
         .map(stripWorkflowMarker);
     const cleanBody = { ...body, input: clientInput };
-    if (!internalRefresh) beginWorkflowTurn(session.workflow);
+    if (!internalRefresh) {
+        beginWorkflowTurn(session.workflow);
+        deliveredInternalResults.delete(session);
+    }
     if (!options.enabled) {
         return { body: cleanBody, prunedOperations: 0, archivedOperations: 0 };
     }
-    const state = session.workflow;
-    const workspace = workspaceRoot(cleanBody) ?? options.repoBridge.workspaceRoot;
-    refreshRepoBridge(state, workspace, options.repoBridge);
+    const workspaceInfo = workspaceRoot(cleanBody);
+    const workspace = workspaceInfo.root ?? options.repoBridge.workspaceRoot;
+    refreshRepoBridge(state, workspace, options.repoBridge, workspaceInfo.hints);
     const metadataProjectKey = typeof body.metadata?.projectKey === "string" ? body.metadata.projectKey : undefined;
     state.projectId ??= options.projectKey?.trim()
         || projectIdentity(metadataProjectKey)
@@ -250,7 +356,12 @@ export async function preprocessResponsesWorkflow(
         if (call) {
             const operation = trackOperationCall(state, call.callId, call.name, call.argumentsText);
             assignItemPhase(session, itemKeys[index], operation.phaseId);
-            if (call.name === "update_plan") applyPlanUpdate(state, call.callId, call.argumentsText);
+            const planCalls = call.name === "update_plan"
+                ? [{ callId: call.callId, argumentsText: call.argumentsText }]
+                : (call.name === "exec" || call.name === "codex")
+                  ? extractCodexUpdatePlanCalls(call.callId, call.argumentsText)
+                  : [];
+            for (const planCall of planCalls) applyPlanUpdate(state, planCall.callId, planCall.argumentsText);
             observeRepositoryOperation(state, operation, options.repoBridge);
             continue;
         }
@@ -331,7 +442,7 @@ export async function preprocessResponsesWorkflow(
             && phaseItemCanDrop(item));
     });
     const memory = workflowMemory(state, options.rereadAfterPhase, options.memory.maxInjectedTokens);
-    filtered.push(...internalResults.slice(-8));
+    filtered.push(...internalResults);
     if (memory) filtered.push(workflowItem(memory));
     const request = checkpointRequest(state, textProtocol);
     if (request) filtered.push(workflowItem(request));

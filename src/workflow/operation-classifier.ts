@@ -1,4 +1,5 @@
 import type { OperationType } from "./types.js";
+import { containsCodexUpdatePlan } from "./codex-code-mode.js";
 
 export type OperationClassification = {
     type: OperationType;
@@ -129,6 +130,9 @@ function classifyCommand(command: string): OperationType {
 
 export function classifyOperation(toolName: string, argumentsText: string): OperationClassification {
     const lower = toolName.toLowerCase();
+    if ((lower === "exec" || lower === "codex") && containsCodexUpdatePlan(argumentsText)) {
+        return classification("PLAN", undefined, undefined, undefined, argumentsText);
+    }
     const args = parseArguments(argumentsText);
     const embeddedCommand = embeddedStringField(argumentsText, "command", "cmd", "script");
     const command = stringField(args, "command", "cmd", "script", "input") ?? embeddedCommand ?? (Object.keys(args).length === 0 ? argumentsText : undefined);

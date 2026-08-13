@@ -30,6 +30,13 @@ export type RequirementStatus =
     | "CANCELLED"
     | "HISTORICAL";
 
+export type RequirementProvenance =
+    | "REAL_USER_REQUIREMENT"
+    | "HOST_CONTEXT"
+    | "PROJECT_INSTRUCTIONS"
+    | "ENVIRONMENT_CONTEXT"
+    | "INTERNAL_WORKFLOW";
+
 export type PhaseMessageLifecycle = "ACTIVE" | "PENDING_DROP" | "ARCHIVED";
 
 export type RequirementMessageLifecycle = "ACTIVE" | "PENDING_DROP" | "ARCHIVED";
@@ -55,7 +62,7 @@ export type OperationRecord = {
     importance: "NORMAL" | "CRITICAL";
     outcome?: "PASS" | "FAIL" | "UNKNOWN";
     repositoryGuard?: {
-        status: "BLOCKED_REREAD" | "SATISFIED";
+        status: "POST_MUTATION_REREAD_REQUIRED" | "SATISFIED";
         paths: string[];
         reason: string;
         violationId: string;
@@ -74,6 +81,7 @@ export type RequirementRecord = {
     status: RequirementStatus;
     supersededBy?: string;
     importance: "NORMAL" | "CRITICAL";
+    provenance?: RequirementProvenance;
     preserveRaw: boolean;
     rawRef?: string;
     historicalDetail?: string;
@@ -122,6 +130,8 @@ export type WorkflowCheckpoint = {
     taskId?: string;
     objective: string;
     requirementState?: string;
+    requirementLedgerVersion?: number;
+    requirementSnapshot?: Array<{ id: string; status: RequirementStatus }>;
     requirementUpdates: Array<{
         id: string;
         status: RequirementRecord["status"];
@@ -350,7 +360,7 @@ export type RepoBridgeState = {
 
 export type HistoricalRequirement = Pick<
     RequirementRecord,
-    "id" | "detail" | "status" | "resolvedStatus" | "importance" | "sourceRefs" | "preserveRaw" | "rawRef" | "taskId"
+    "id" | "detail" | "status" | "resolvedStatus" | "importance" | "provenance" | "sourceRefs" | "preserveRaw" | "rawRef" | "taskId"
 >;
 
 export type HistorianNarrative = {
@@ -440,6 +450,7 @@ export type WorkflowState = {
     nextCheckpointNumber: number;
     nextRawNumber: number;
     nextRequirementMessageNumber: number;
+    requirementLedgerVersion: number;
     nextPlanItemNumber: number;
     nextTaskNumber: number;
     checkpointRetryPhaseId?: string;
@@ -502,7 +513,7 @@ export type WorkflowOptions = {
     projectKey?: string;
     repoBridge: {
         enabled: boolean;
-        enforceReread: boolean;
+        requireRereadAfterPhase: boolean;
         workspaceRoot?: string;
         hashMaxBytes: number;
         gitTimeoutMs: number;
@@ -548,7 +559,7 @@ export const DEFAULT_WORKFLOW_OPTIONS: WorkflowOptions = {
     archiveSemanticRaw: true,
     repoBridge: {
         enabled: true,
-        enforceReread: true,
+        requireRereadAfterPhase: true,
         hashMaxBytes: 4 * 1024 * 1024,
         gitTimeoutMs: 2_000,
     },

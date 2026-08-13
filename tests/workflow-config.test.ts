@@ -10,7 +10,7 @@ test("workflow defaults are enabled and Codex-ready", () => {
     assert.equal(options.workflow?.cheapModel.enabled, false);
     assert.equal(options.workflow?.rereadAfterPhase, true);
     assert.equal(options.workflow?.repoBridge.enabled, true);
-    assert.equal(options.workflow?.repoBridge.enforceReread, true);
+    assert.equal(options.workflow?.repoBridge.requireRereadAfterPhase, true);
     assert.equal(options.workflow?.cachePolicy.protectCacheHitRatio, 0.65);
     assert.equal(options.workflow?.cachePolicy.expectedTokensPerStep, 8000);
     assert.equal(options.workflow?.memory.maxInjectedTokens, 12000);
@@ -78,7 +78,7 @@ test("workflow environment settings override context, pruning, archive and proje
         projectKey: "repo-main",
         repoBridge: {
             enabled: false,
-            enforceReread: false,
+            requireRereadAfterPhase: false,
             workspaceRoot: "H:\\Auto\\repo-main",
             hashMaxBytes: 1048576,
             gitTimeoutMs: 5000,

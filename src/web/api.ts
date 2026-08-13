@@ -146,10 +146,16 @@ function workflowPatch(value: unknown): JsonObject {
     }
     if (source.repoBridge !== undefined) {
         const input = plainObject(source.repoBridge, "workflow.repoBridge");
-        allowedKeys(input, "workflow.repoBridge", ["enabled", "enforceReread", "workspaceRoot", "hashMaxBytes", "gitTimeoutMs"]);
+        allowedKeys(input, "workflow.repoBridge", ["enabled", "requireRereadAfterPhase", "enforceReread", "workspaceRoot", "hashMaxBytes", "gitTimeoutMs"]);
         const output: JsonObject = {};
         copyBoolean(input, output, "enabled", "workflow.repoBridge");
-        copyBoolean(input, output, "enforceReread", "workflow.repoBridge");
+        if ("requireRereadAfterPhase" in input) {
+            copyBoolean(input, output, "requireRereadAfterPhase", "workflow.repoBridge");
+        } else {
+            copyBoolean(input, output, "enforceReread", "workflow.repoBridge");
+            if ("enforceReread" in output) output.requireRereadAfterPhase = output.enforceReread;
+            delete output.enforceReread;
+        }
         copyString(input, output, "workspaceRoot", "workflow.repoBridge", true);
         copyNumber(input, output, "hashMaxBytes", "workflow.repoBridge", "integer");
         copyNumber(input, output, "gitTimeoutMs", "workflow.repoBridge", "integer");

@@ -361,7 +361,8 @@ with no file at all).
 | `BILI_WORKFLOW_ARCHIVE_RAW` | `1` | Archive semantically pruned raw output |
 | `BILI_WORKFLOW_PROJECT_KEY` | *(auto)* | Explicit stable project identity when Codex metadata/cwd is unavailable |
 | `BILI_WORKFLOW_REPO_BRIDGE` | `1` | Track current workspace/repository identity and file freshness |
-| `BILI_WORKFLOW_ENFORCE_REREAD` | `1` | Block mutations that rely on stale pre-phase/HEAD/file reads |
+| `BILI_WORKFLOW_REQUIRE_REREAD_AFTER_PHASE` | `1` | Require a fresh repository read before trusting code facts after a phase boundary |
+| `BILI_WORKFLOW_ENFORCE_REREAD` | *(legacy alias)* | Deprecated compatibility alias for `BILI_WORKFLOW_REQUIRE_REREAD_AFTER_PHASE` |
 | `BILI_WORKFLOW_WORKSPACE_ROOT` | *(auto)* | Explicit workspace root when Codex request metadata is unavailable |
 | `BILI_WORKFLOW_REPO_HASH_MAX_BYTES` | `4194304` | Maximum file size hashed by Repo Bridge |
 | `BILI_WORKFLOW_REPO_GIT_TIMEOUT_MS` | `2000` | Timeout for read-only repository probes |
@@ -408,7 +409,7 @@ The config file is a single JSON object. Example:
       }
     },
     "archive": { "semanticRaw": true },
-    "repoBridge": { "enabled": true, "enforceReread": true },
+    "repoBridge": { "enabled": true, "requireRereadAfterPhase": true },
     "cache": {
       "protectCacheHitRatio": 0.65,
       "highGrowthRate": 0.18,

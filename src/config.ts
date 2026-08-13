@@ -289,6 +289,8 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         }
     }
     const workflowModels = parseWorkflowModels(fileConfig.workflow?.models);
+    const configuredRereadAfterPhase = fileConfig.workflow?.repoBridge?.requireRereadAfterPhase
+        ?? fileConfig.workflow?.repoBridge?.enforceReread;
     const workflow: WorkflowOptions = {
         enabled: (env.BILI_WORKFLOW_ENABLED ?? (fileConfig.workflow?.enabled === false ? "0" : "1")) !== "0",
         targetContextRatio: parseWorkflowRatio(
@@ -336,7 +338,9 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         projectKey: nonEmpty(env.BILI_WORKFLOW_PROJECT_KEY) ?? nonEmpty(fileConfig.workflow?.projectKey),
         repoBridge: {
             enabled: (env.BILI_WORKFLOW_REPO_BRIDGE ?? (fileConfig.workflow?.repoBridge?.enabled === false ? "0" : "1")) !== "0",
-            enforceReread: (env.BILI_WORKFLOW_ENFORCE_REREAD ?? (fileConfig.workflow?.repoBridge?.enforceReread === false ? "0" : "1")) !== "0",
+            requireRereadAfterPhase: (env.BILI_WORKFLOW_REQUIRE_REREAD_AFTER_PHASE
+                ?? env.BILI_WORKFLOW_ENFORCE_REREAD
+                ?? (configuredRereadAfterPhase === false ? "0" : "1")) !== "0",
             workspaceRoot: nonEmpty(env.BILI_WORKFLOW_WORKSPACE_ROOT) ?? nonEmpty(fileConfig.workflow?.repoBridge?.workspaceRoot),
             hashMaxBytes: parseWorkflowInteger(
                 env.BILI_WORKFLOW_REPO_HASH_MAX_BYTES ?? fileConfig.workflow?.repoBridge?.hashMaxBytes,
@@ -495,6 +499,8 @@ type FileConfig = {
         archive?: { semanticRaw?: boolean };
         repoBridge?: {
             enabled?: boolean;
+            requireRereadAfterPhase?: boolean;
+            /** @deprecated Use requireRereadAfterPhase. */
             enforceReread?: boolean;
             workspaceRoot?: string;
             hashMaxBytes?: number;

@@ -149,6 +149,10 @@ export function recordWorkflowCheckpoint(
         ...(phase.taskId ? { taskId: phase.taskId } : {}),
         objective: text(args.objective) ?? phase.objective,
         ...(text(args.requirementState) ? { requirementState: text(args.requirementState) } : {}),
+        requirementLedgerVersion: state.requirementLedgerVersion,
+        requirementSnapshot: Object.values(state.requirements)
+            .filter((requirement) => requirement.taskId === phase.taskId && requirement.provenance === "REAL_USER_REQUIREMENT")
+            .map((requirement) => ({ id: requirement.id, status: requirement.status })),
         requirementUpdates: updates,
         completedWork,
         changedFiles: strings(args.changedFiles),
@@ -243,7 +247,7 @@ export function checkpointRequest(state: WorkflowState, textProtocol: boolean): 
     const action = textProtocol
         ? `Emit exactly <workflow_checkpoint>{"phaseId":"${phaseId}","objective":"...","requirementUpdates":[],"completedWork":"...","changedFiles":[],"currentState":"...","decisions":[],"rejectedApproaches":[],"failedAttempts":[],"validation":[],"blockers":[],"unresolvedIssues":[],"criticalRefs":[],"keepRefs":[]}</workflow_checkpoint> with no surrounding prose.`
         : `Call workflow_checkpoint with phaseId "${phaseId}" and the structured result.`;
-    return `<workflow-checkpoint-request>\nPhase ${phaseId} has completed.\nObjective: ${phase.objective}\nOperations: ${operationSummary.join(", ")}\nBefore continuing, checkpoint final results, decisions and validation. Do not copy old source code or full logs. Repository state remains authoritative.\n${action}\n</workflow-checkpoint-request>`;
+    return `<workflow-checkpoint-request>\nPhase ${phaseId} has completed.\nObjective: ${phase.objective}\nOperations: ${operationSummary.join(", ")}\nBefore continuing, checkpoint final results, decisions and validation. Do not copy old source code or full logs. Repository state remains authoritative. The requirement ledger is tracked deterministically; only list requirementUpdates for requirements changed in this phase. Unchanged requirements remain bound to the checkpoint ledger snapshot automatically.\n${action}\n</workflow-checkpoint-request>`;
 }
 
 export function workflowMemory(state: WorkflowState, rereadAfterPhase: boolean, maxTokens = 12_000): string | undefined {
@@ -262,7 +266,7 @@ export function workflowMemory(state: WorkflowState, rereadAfterPhase: boolean, 
         });
     const prefix = `<workflow-memory>\nActive task: ${state.activeTaskId ?? "untracked"}\nActive requirements:`;
     const reread = rereadAfterPhase
-        ? "\nFor code needed in the current phase, re-read the repository; historical memory is not authoritative for code facts."
+        ? "\nFor code needed in the current phase, re-read the repository; historical memory is not authoritative for code facts. Re-read only repository/code facts that may have changed after a phase boundary. Do not re-read stable user goals or requirement documents solely because a phase rolled over; use the active requirement ledger/checkpoint unless that source changed or required details are unavailable."
         : "";
     const suffix = `${reread}\n</workflow-memory>`;
     if (estimateTokensFast(`${prefix}${suffix}`) > maxTokens) return undefined;
