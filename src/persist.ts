@@ -408,6 +408,8 @@ export class SessionStore {
             );
         }
         await Promise.all(pending);
+        // Drain writes whose timer fired (absent from `dirty`) but are still mid-flight.
+        await Promise.allSettled([...this.writeChains.values()]);
     }
 
     /** Whether a write is currently pending (debounce timer armed) for a id. */

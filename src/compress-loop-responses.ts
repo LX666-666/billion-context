@@ -1,7 +1,5 @@
 import {
     buildStatusReport,
-    collectBlockContent,
-    deactivateBlock,
     estimateTokensFast,
     type CompressionCore,
     type Config,
@@ -35,6 +33,7 @@ import { log as loggerLog } from "./logger.js";
 import { applyRanges } from "./stream.js";
 import { resolveDecompress } from "./decompress-shared.js";
 import { buildVisibilityMarker } from "./compress-loop.js";
+import { MAX_LOOP_ROUNDS } from "./loop/index.js";
 import { fetchWithTimeout } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { captureUsage, type UsageCaptureCtx } from "./usage/capture.js";
@@ -48,12 +47,9 @@ import { preprocessResponsesWorkflow } from "./workflow/responses-preprocessor.j
 import type { ResponsesRequestBody } from "./responses.js";
 import { buildWorkflowResultText } from "./workflow/workflow-item.js";
 
-/** Text-protocol mode: the host (OpenAI Codex code_mode) cannot coexist with
- *  a declared `tools` array, so compression is triggered by a text marker the
- *  model emits in its output_text. Detected here in the compress loop. */
 const TEXT_PROTOCOL = process.env.ACP_COMPRESS_PROTOCOL === "text";
 
-/** Extract <acp_compress>{json}</acp_compress> triggers from assistant text.
+/** Extract  triggers from assistant text.
  *  Returns the cleaned text (trigger removed) and synthesized function-call
  *  accumulators so the existing compress loop can execute them like real tool
  *  calls and loop again with the result. */
@@ -499,10 +495,11 @@ export async function compressLoopResponsesJson(
 ): Promise<Record<string, unknown>> {
     let current = initialResponse;
     const textProtocol = ctx.textProtocol ?? TEXT_PROTOCOL;
-    for (let loopCount = 1; loopCount <= 5; loopCount++) {
+    for (let loopCount = 1; loopCount <= MAX_LOOP_ROUNDS; loopCount++) {
         const output = responsesJsonOutput(current);
         const extracted = extractTextTriggers(output.text);
         const allCalls = [...output.calls, ...extracted.calls].filter((call) => call.name.length > 0);
+        const nativeCallIds = new Set(output.calls.map((call) => call.callId));
         const proxyCalls = allCalls.filter((call) => RESPONSES_PROXY_TOOL_NAMES.has(call.name));
         const realCalls = allCalls.filter((call) => !RESPONSES_PROXY_TOOL_NAMES.has(call.name));
         const mutatingProxy = proxyCalls.filter((call) => MUTATING_PROXY_TOOLS.has(call.name));
@@ -537,9 +534,9 @@ export async function compressLoopResponsesJson(
             }
             const result = executeProxyTool(call.name, args, ctx);
             ctx.log(`[acp-proxy: responses JSON ${call.name} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
-            inputItems.push(textProtocol
-                ? { type: "message", role: "assistant", content: buildWorkflowResultText(call.name, buildVisibilityMarker(call.name, result)) }
-                : { type: "function_call_output", call_id: call.callId, output: result });
+            inputItems.push(nativeCallIds.has(call.callId)
+                ? { type: "message", role: "developer", content: buildVisibilityMarker(call.name, result) }
+                : { type: "message", role: "assistant", content: buildWorkflowResultText(call.name, buildVisibilityMarker(call.name, result)) });
         }
         const checkpointRetryExhausted = proxyCalls.some((call) =>
             call.name === "workflow_checkpoint"
@@ -569,10 +566,9 @@ export async function compressLoopResponsesJson(
             clearTimer();
         }
     }
-    ctx.log("[acp-proxy: responses JSON compress loop limit (5) reached]");
+    ctx.log(`[acp-proxy: responses JSON compress loop limit (${MAX_LOOP_ROUNDS}) reached]`);
     return current;
 }
-
 export async function* compressLoopResponsesStream(
     initialUpstream: ReadableStream<Uint8Array>,
     ctx: CompressLoopResponsesCtx,

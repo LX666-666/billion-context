@@ -4,7 +4,8 @@ import { createCore, type CompressionCore, type Config, type CoreMessage, type N
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { resolveContextLimit } from "./config.js";
+import { resolveContextLimit, resolveCompressProtocol } from "./config.js";
+import { resolveRequestConfig } from "./compress-settings.js";
 import { contextFromRegistry, loadRegistry } from "./registry.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher } from "./upstream-proxy.js";
@@ -35,7 +36,7 @@ import {
     conversationSignalResponses,
 } from "./responses.js";
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary } from "./session.js";
-import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_WORKFLOW_TOOLS_ANTHROPIC, ACP_WORKFLOW_TOOLS_OPENAI, ACP_CONTEXT_TOOLS_RESPONSES, WORKFLOW_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
+import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_WORKFLOW_TOOLS_ANTHROPIC, ACP_WORKFLOW_TOOLS_OPENAI, ACP_CONTEXT_TOOLS_RESPONSES, WORKFLOW_TOOLS_RESPONSES, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt, buildCompressHybridSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
 import {
@@ -59,19 +60,18 @@ import {
 import { restoreCodexConfig } from "./web/codex-config.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
-import { compressLoopJson, compressLoopStream } from "./compress-loop.js";
-import { compressLoopAnthropicJson, compressLoopAnthropicStream } from "./compress-loop-anthropic.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
 import { defaultLogFile, stateDir } from "./paths.js";
-import { compressLoopResponsesJson, compressLoopResponsesStream } from "./compress-loop-responses.js";
+import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { captureUsage } from "./usage/capture.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
-import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./stream-responses.js";
+import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, type ConversationIdentity } from "./session-id.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "./bili-message.js";
+import { isLoopbackAddress } from "./util.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
 import { preprocessResponsesWorkflow } from "./workflow/responses-preprocessor.js";
@@ -92,9 +92,42 @@ const UPSTREAM_HOP_HEADERS = new Set([
     // forward the upstream encoding marker when the body is rewritten or
     // streamed from fetch, otherwise clients try to decompress plain bytes.
     "content-encoding",
+    // RFC 7230 §6.1 hop-by-hop headers. proxy-authorization in particular
+    // carries client→proxy credentials that must never reach the model
+    // endpoint. (#80)
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "upgrade",
 ]);
 
 let codexExitRestoreRegistered = false;
+
+// RFC 7230 §6.1: the Connection header names additional hop-by-hop headers
+// that must be stripped per-message. Returns their lowercased names.
+function connectionNamedHeaders(conn: string | string[] | undefined): Set<string> {
+    const out = new Set<string>();
+    if (!conn) return out;
+    for (const part of Array.isArray(conn) ? conn : [conn]) {
+        for (const name of part.split(",")) {
+            const t = name.trim().toLowerCase();
+            if (t) out.add(t);
+        }
+    }
+    return out;
+}
+
+function buildForwardHeaders(headers: Record<string, string>): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(headers)) {
+        if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
+        out[k] = v;
+    }
+    out["content-type"] = "application/json";
+    return out;
+}
 
 export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.IncomingMessage): { upstream: string; rewrittenUrl: string; explicitProtocol?: "openai" | "anthropic" | "responses" } | undefined {
     // MITM mode: the request arrived over a CONNECT tunnel we terminated
@@ -194,6 +227,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 (nOverrides ? ` — context overrides for ${nOverrides} upstream URL(s)` : "")
                 + (opts.mitm.enabled ? ` — MITM proxy on (whitelist)${opts.mitm.domains.length ? ` +${opts.mitm.domains.join(",")}` : ""}` : ""),
         );
+        if (opts.debug) {
+            log("info", `[debug] build features: raw-HTTP-capture(on) | remote_compaction_v2-strip(on) | cert-MITM-launcher(on) | strip-acp-summary(on) — seeing this line confirms the launcher build (not registry 0.1.34)`);
+        }
     });
     // Listen errors (EADDRINUSE port taken, EACCES privileged port, EAFNOSUPPORT
     // bad host) surface as an 'error' event on the server. Without a listener
@@ -296,24 +332,42 @@ type Prepared = {
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
     anthropicSystem?: AnthropicRequestBody["system"];
+    nudge?: NudgeDecision;
 };
 
-/** True if `addr` is a loopback (IPv4 127.x or IPv6 ::1 / ::ffff:127.0.0.1).
- *  Used to gate the management endpoints to local connections only. */
-function isLoopback(addr: string | undefined): boolean {
-    if (!addr) return false;
-    return addr === "::1" || addr === "127.0.0.1" || addr.startsWith("127.") || addr.startsWith("::ffff:127.");
-}
 
-function isTrustedAdminOrigin(origin: string | undefined, host: string | undefined): boolean {
-    if (!origin) return true;
-    if (!host) return false;
+function isTrustedAdminOrigin(origin: string | undefined, host: string | undefined, trustedHosts: Set<string>): boolean {
+    // Host must be one of OUR listen identities regardless of whether an
+    // Origin header is present. A same-origin browser GET/fetch (the DNS
+    // rebinding read path: evil.com → 127.0.0.1) often carries NO Origin
+    // header, so gating on Origin alone would leave config reads exposed.
+    if (!host || !trustedHosts.has(host.toLowerCase())) return false;
+    if (!origin) return true; // non-browser client (curl, CLI UI) on a trusted Host
     try {
         const parsed = new URL(origin);
-        return (parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.host === host;
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+        return trustedHosts.has(parsed.host.toLowerCase());
     } catch {
         return false;
     }
+}
+
+/** The set of Host header values we accept on management endpoints. DNS
+ *  rebinding (attacker resolves evil.com → 127.0.0.1) can make a browser
+ *  request carry Origin == Host == evil.com:port and still reach loopback;
+ *  only pinning Host to our own listen address defeats it. */
+function adminTrustedHosts(bindHost: string, port: number): Set<string> {
+    const p = String(port);
+    const names = ["localhost", "127.0.0.1", "[::1]"];
+    if (bindHost && bindHost !== "0.0.0.0" && bindHost !== "::" && !names.includes(bindHost)) {
+        names.push(bindHost);
+    }
+    const set = new Set<string>();
+    for (const n of names) {
+        set.add(`${n}:${p}`.toLowerCase());
+        if (p === "80") set.add(n.toLowerCase());
+    }
+    return set;
 }
 
 async function handle(
@@ -332,12 +386,15 @@ async function handle(
     // in that case we still must NOT expose management to the LAN. Only the
     // proxy /bili/ and CONNECT (model traffic) endpoints remain open to all.
     const isAdminPath = req.url === "/__bili/" || req.url?.startsWith("/__bili/") || req.url === "/__acp/" || req.url?.startsWith("/__acp/");
-    if (isAdminPath && !isLoopback(req.socket.remoteAddress)) {
+    if (isAdminPath && !isLoopbackAddress(req.socket.remoteAddress)) {
         res.writeHead(403, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "management endpoints are loopback-only; access denied for " + (req.socket.remoteAddress ?? "unknown") }));
         return;
     }
-    if (isAdminPath && !isTrustedAdminOrigin(req.headers.origin, req.headers.host)) {
+    // localPort, not opts.port: when listening on port 0 (dynamic assignment,
+    // programmatic embedding, tests) the real port differs from opts.port and
+    // pinning to the configured value would 403 every admin request.
+    if (isAdminPath && !isTrustedAdminOrigin(req.headers.origin, req.headers.host, adminTrustedHosts(opts.host, req.socket.localPort ?? opts.port))) {
         res.writeHead(403, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "management request origin does not match the local bili UI" }));
         return;
@@ -476,7 +533,7 @@ async function handle(
         urlPath = url.split("?", 2)[0];
         responsesCompact = urlPath.endsWith("/responses/compact");
         route = resolveUpstream(opts, req.url ?? "", req);
-        upstreamOrigin = route ? route.upstream : opts.upstream;
+        upstreamOrigin = route ? route.upstream : /^https?:\/\//i.test(url) ? new URL(url).origin : opts.upstream;
         protocol =
             route?.explicitProtocol
             ?? (req.method === "POST" && bodyBuffer.length > 0
@@ -522,24 +579,40 @@ async function handle(
             parsed = null;
         }
     }
-    // Per-request context limit: look up body.model against the per-route
-    // model declaration first, then the built-in table.
+    // Capture the CLIENT's raw incoming request (before bili rebuilds) to
+    // resolve whether codex sends previous_response_id + full input vs delta.
+    if (opts.debug && parsed && typeof parsed === "object") {
+        try {
+            const p = parsed as Record<string, unknown>;
+            const hasPrev = p.previous_response_id !== undefined;
+            const inLen = Array.isArray(p.input) ? p.input.length : 0;
+            log("info", `[debug] INCOMING previous_response_id=${hasPrev ? String(p.previous_response_id).slice(0, 16) : "absent"} input_items=${inLen} instructions=${p.instructions !== undefined ? "present" : "absent"}`);
+            const rawDir = `${stateDir()}/raw`;
+            try { fs.mkdirSync(rawDir, { recursive: true }); } catch { /* best-effort */ }
+            const hdrs = Object.entries(req.headers)
+                .filter(([k]) => !/authorization|x-api-key|cookie/i.test(k))
+                .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(",") : v}`).join("\n");
+            fs.writeFileSync(`${rawDir}/${Date.now()}-INCOMING.txt`, `${req.method} ${req.url}\n${hdrs}\n\n${bodyBuffer.toString("utf8")}`);
+        } catch { /* best-effort dump */ }
+    }
+    // Per-request context limit + compression tuning: look up body.model against
+    // the per-route model declaration first, then the built-in table / registry.
+    // Compress settings (global → provider → model) merge deepest-field-wins and
+    // are applied on top of the resolved limit. `compress.contextLimit` (an
+    // absolute number, a "70%" string of the native window, or unset → native)
+    // overrides the table.
     let reqConfig = config;
     if (parsed && typeof parsed === "object") {
         const model = (parsed as { model?: string }).model;
         reqModel = model;
         if (model) {
-            // Match config by the embedded upstream URL (the /bili/<this> string).
-            // The registry is a middle layer when config doesn't cover this URL/model.
             const embeddedUrl = route?.rewrittenUrl;
-            let limit = resolveContextLimit(opts.routes, embeddedUrl, model);
-            if (!limit && embeddedUrl) {
+            let native = resolveContextLimit(opts.routes, embeddedUrl, model);
+            if (!native && embeddedUrl) {
                 const host = (() => { try { return new URL(embeddedUrl).host; } catch { return undefined; } })();
-                limit = await contextFromRegistry(model, host);
+                native = await contextFromRegistry(model, host);
             }
-            if (limit && limit !== config.modelContextLimit) {
-                reqConfig = { ...config, modelContextLimit: limit };
-            }
+            reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress);
         }
     }
     let prepared: Prepared | null = null;
@@ -581,28 +654,31 @@ async function handle(
             ? responsesIdentity.value
             : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? undefined });
-        // Serialize per-session: prepare (processTurn mutates state) + forward
-        // (stream rewriter mutates state via compress/decompress) must not
-        // interleave across concurrent requests on the same session.
-        await withSessionLock(session, async () => {
-            prepared = await (
-                countTokens
-                    ? prepareCountTokens(parsed as AnthropicRequestBody, core, reqConfig, log, session)
-                    : protocol === "anthropic"
-                      ? prepareAnthropic(parsed as AnthropicRequestBody, req, opts, core, reqConfig, log, session)
-                      : protocol === "openai"
-                        ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, log, session)
-                        : responsesCompact
-                          ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session)
-                          : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, log, session, responsesIdentity!)
-            );
-            acquireInFlight(session);
-            try {
+        // acquireInFlight must precede the lock so evictOldest() cannot flush
+        // this session between getSession and lock acquisition (inFlight===0
+        // window). Released in the outer finally after forward completes.
+        acquireInFlight(session);
+        try {
+            // Serialize per-session: prepare (processTurn mutates state) + forward
+            // (stream rewriter mutates state via compress/decompress) must not
+            // interleave across concurrent requests on the same session.
+            await withSessionLock(session, async () => {
+                prepared = await (
+                    countTokens
+                        ? prepareCountTokens(parsed as AnthropicRequestBody, core, reqConfig, log, session)
+                        : protocol === "anthropic"
+                          ? prepareAnthropic(parsed as AnthropicRequestBody, req, opts, core, reqConfig, log, session)
+                          : protocol === "openai"
+                            ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, log, session)
+                            : responsesCompact
+                              ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session)
+                              : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, log, session, responsesIdentity!)
+                );
                 await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, affinity, reqModel);
-            } finally {
-                releaseInFlight(session);
-            }
-        });
+            });
+        } finally {
+            releaseInFlight(session);
+        }
     }
     if (!prepared) {
         if (protocol === null && !opts.passthrough) {
@@ -613,6 +689,14 @@ async function handle(
 }
 
 const ACP_TAG_MARK = "\x3cacp ";
+
+// acp-kernel injects an in-place `acp_summary_*` at the compressed range as a
+// generic-library fallback; this host strips it because the compress tool-call
+// already carries the summary (hideConsumedCompressCalls keeps active-block calls),
+// and a mid-stream insertion would shift the upstream prefix-cache breakpoint.
+function stripKernelSummaries(messages: BiliMessage[]): BiliMessage[] {
+    return messages.filter((m) => !(m.id ?? "").startsWith("acp_summary_"));
+}
 
 function diagTagSummary(messages: CoreMessage[], sessionId: string, strategy: string): string {
     let textTagged = 0;
@@ -657,6 +741,7 @@ async function prepareAnthropic(
 
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
+    let nudge: NudgeDecision | undefined;
     let rebuiltMessages = parsed.messages;
     let systemOut = parsed.system;
     let toolsOut = parsed.tools;
@@ -678,6 +763,7 @@ async function prepareAnthropic(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
+        nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
@@ -685,7 +771,7 @@ async function prepareAnthropic(
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
-        processedMessages = turn.messages;
+        processedMessages = stripKernelSummaries(turn.messages);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
 
@@ -695,7 +781,7 @@ async function prepareAnthropic(
         }
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.
-        if (turn.nudge?.shouldInject && opts.compress.injectTool) {
+        if (opts.compress.injectNudge && turn.nudge?.shouldInject && opts.compress.injectTool) {
             try {
                 const rendered = renderNudgeText(turn.nudge);
                 if (rendered.text) {
@@ -711,7 +797,7 @@ async function prepareAnthropic(
 
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: proxyInjected } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: proxyInjected, nudge } as Prepared;
 }
 
 async function prepareOpenai(
@@ -729,6 +815,7 @@ async function prepareOpenai(
 
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
+    let nudge: NudgeDecision | undefined;
     let rebuiltMessages = parsed.messages;
     let toolsOut = parsed.tools;
 
@@ -753,6 +840,7 @@ async function prepareOpenai(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
+        nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
@@ -760,7 +848,7 @@ async function prepareOpenai(
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
-        processedMessages = turn.messages;
+        processedMessages = stripKernelSummaries(turn.messages);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToOpenai(processedMessages as BiliMessage[]);
 
@@ -778,7 +866,7 @@ async function prepareOpenai(
             toolsOut = injectOpenaiTool(parsed.tools, shouldInject, workflowOptions.enabled);
         }
         // Nudge as a separate trailing user message (cache-friendly).
-        if (turn.nudge?.shouldInject && shouldInject) {
+        if (opts.compress.injectNudge && turn.nudge?.shouldInject && shouldInject) {
             try {
                 const rendered = renderNudgeText(turn.nudge);
                 if (rendered.text) {
@@ -803,7 +891,7 @@ async function prepareOpenai(
         (rebuilt as Record<string, unknown>).stream_options = { include_usage: true };
     }
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: proxyInjected } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: proxyInjected, nudge } as Prepared;
 }
 
 async function prepareResponses(
@@ -825,6 +913,7 @@ async function prepareResponses(
 
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
+    let nudge: NudgeDecision | undefined;
     let responsesProjection: ResponsesProjection | undefined;
     let rebuiltInput: ResponseInputItem[] | string = parsed.input;
     let toolsOut = parsed.tools;
@@ -832,7 +921,8 @@ async function prepareResponses(
     const shouldInject = opts.compress.injectTool;
     const responsesTextProtocol = FORCE_TEXT_PROTOCOL ||
         isChatGptCodexUpstream(session.meta.upstreamOrigin) ||
-        isCodexResponsesLite(req.headers, parsed);
+        isCodexResponsesLite(req.headers, parsed) ||
+        resolveCompressProtocol(opts.routes, session.meta.upstreamOrigin) === "marker";
     const workflowOptions = opts.workflow ?? DEFAULT_WORKFLOW_OPTIONS;
     let workflowParsed = parsed;
 
@@ -859,6 +949,7 @@ async function prepareResponses(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
+        nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
@@ -866,24 +957,28 @@ async function prepareResponses(
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
-        processedMessages = turn.messages;
+        processedMessages = stripKernelSummaries(turn.messages);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         const prompts: string[] = [];
         if (shouldInject && !process.env.ACP_NO_COMPRESS_PROMPT) {
-            prompts.push(responsesTextProtocol ? buildCompressTextSystemPrompt() : buildCompressSystemPrompt());
+            prompts.push(responsesTextProtocol ? buildCompressHybridSystemPrompt() : buildCompressSystemPrompt());
         }
         if (workflowOptions.enabled) prompts.push(buildWorkflowSystemPrompt(responsesTextProtocol));
         if (prompts.length > 0) {
             const devContent = [...projection.systemParts, ...prompts].join("\n\n---\n\n");
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
-            if (!responsesTextProtocol && !process.env.ACP_NO_INJECT_TOOL) {
-                toolsOut = injectResponsesTool(workflowParsed.tools, shouldInject, workflowOptions.enabled);
+            if (!process.env.ACP_NO_INJECT_TOOL) {
+                const desired = [
+                    ...(shouldInject ? (responsesTextProtocol ? ACP_READONLY_TOOLS_RESPONSES : ACP_CONTEXT_TOOLS_RESPONSES) : []),
+                    ...(workflowOptions.enabled ? WORKFLOW_TOOLS_RESPONSES : []),
+                ];
+                toolsOut = injectResponsesTool(workflowParsed.tools, desired);
             }
         } else if (projection.systemParts.length > 0) {
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, projection.systemParts.join("\n\n---\n\n"));
         }
-        if (turn.nudge?.shouldInject && shouldInject) {
+        if (opts.compress.injectNudge && turn.nudge?.shouldInject && shouldInject) {
             try {
                 const rendered = renderNudgeText(turn.nudge);
                 if (rendered.text) {
@@ -910,14 +1005,16 @@ async function prepareResponses(
     );
     if (promptCacheKey && !rebuilt.prompt_cache_key) rebuilt.prompt_cache_key = promptCacheKey;
     // This adapter is stateless: we replay the FULL conversation in `input`.
-    // Strip Responses' native chaining fields so the upstream does not resolve
-    // stored server-side state on top of the input we already sent. Forwarding
-    // previous_response_id would make the prefix shift every turn (as the id
-    // advances) and duplicate history — breaking prompt-cache. `instructions`
-    // was already lifted into the developer message at input[1], so forwarding
-    // it again here double-sends it and violates the responses_lite contract
+    // Strip Responses' native chaining field so the upstream does not resolve
+    // stored server-side state ON TOP of the input we already sent (which would
+    // duplicate history for clients that use store:true + chaining). Empirically
+    // codex sends store:false and never sets previous_response_id, so this is a
+    // no-op for codex — kept defensively for any client that does chain. Set
+    // ACP_KEEP_RESPONSE_ID=1 to preserve it (diagnostic only). `instructions`
+    // was already lifted into the developer message at input[1]; forwarding it
+    // again here double-sends it and violates the responses_lite contract
     // (top-level instructions must stay empty for code_mode tool exposure).
-    delete rebuilt.previous_response_id;
+    if (process.env.ACP_KEEP_RESPONSE_ID !== "1") delete rebuilt.previous_response_id;
     delete rebuilt.instructions;
     // Log the final tools we forward upstream so we can confirm ACP tools are
     // present. Distinguishes "compress" (top-level function) from Codex
@@ -941,6 +1038,7 @@ async function prepareResponses(
         stream,
         compressInjected: shouldInject || workflowOptions.enabled,
         responsesTextProtocol,
+        nudge,
     };
 }
 
@@ -964,8 +1062,9 @@ export function prepareCountTokens(
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: session.stats.lastInputTokens, renderTags: "text-only" });
-        const rebuiltMessages = coreToAnthropic(turn.messages as BiliMessage[], cacheControls);
-        log("info", `[${sessionId}] count_tokens pruned: ${msgs.length} → ${turn.messages.length} msgs`);
+        const stripped = stripKernelSummaries(turn.messages as BiliMessage[]);
+        const rebuiltMessages = coreToAnthropic(stripped, cacheControls);
+        log("info", `[${sessionId}] count_tokens pruned: ${msgs.length} → ${stripped.length} msgs`);
         return {
             body: JSON.stringify({ ...parsed, messages: rebuiltMessages }),
             session,
@@ -1012,10 +1111,11 @@ export function isChatGptCodexUpstream(upstream: string | undefined): boolean {
     }
 }
 
-export function isCodexResponsesLite(headers: http.IncomingHttpHeaders, body: ResponsesRequestBody): boolean {
+export function isCodexResponsesLite(headers: http.IncomingHttpHeaders, _body: ResponsesRequestBody): boolean {
+    // additional_tools is NOT a lite signal: codex always sends it and it coexists
+    // with injected `tools` (verified end-to-end). Only the explicit header counts.
     if (headers["x-openai-internal-codex-responses-lite"] !== undefined) return true;
-    if (Object.prototype.hasOwnProperty.call(body, "additional_tools")) return true;
-    return Array.isArray(body.input) && body.input.some((item) => item.type === "additional_tools");
+    return false;
 }
 
 export function shouldInjectPromptCacheKey(
@@ -1085,23 +1185,17 @@ function injectOpenaiTool(tools: OpenAITool[] | undefined, includeCompression: b
  *  In text mode we keep `tools` untouched (undefined) so code_mode stays
  *  active, and detect the trigger in the output_text stream instead. */
 const FORCE_TEXT_PROTOCOL = process.env.ACP_COMPRESS_PROTOCOL === "text";
-/** Inject selected compression and workflow tools in Responses API flat format. */
-function injectResponsesTool(
-    tools: unknown[] | undefined,
-    includeCompression = true,
-    includeWorkflow = true,
-): unknown[] {
-    const desired = [
-        ...(includeCompression ? ACP_CONTEXT_TOOLS_RESPONSES : []),
-        ...(includeWorkflow ? WORKFLOW_TOOLS_RESPONSES : []),
-    ];
-    if (!Array.isArray(tools)) return [...desired];
+/** Inject all ACP tools (compress/decompress/search_context/acp_status) in
+ *  Responses API flat format, matching the PROXY_TOOL_NAMES set the compress
+ *  loop dispatches on. Idempotent. */
+function injectResponsesTool(tools: unknown[] | undefined, toolsToAdd: readonly { name: string }[] = ACP_TOOLS_RESPONSES): unknown[] {
+    if (!Array.isArray(tools)) return [...toolsToAdd];
     const present = new Set(
         tools
             .map((t) => (t as { name?: string })?.name)
             .filter((n): n is string => typeof n === "string"),
     );
-    const additions = desired.filter((t) => !present.has(t.name));
+    const additions = toolsToAdd.filter((t) => !present.has(t.name));
     return [...tools, ...additions];
 }
 
@@ -1121,7 +1215,9 @@ async function forward(
     // rewrittenUrl may use a `mitm://` scheme (for config-lookup distinction
     // — see resolveUpstream). fetch needs the real https:// scheme, so strip
     // mitm:// back to https:// for the actual upstream request.
-    const rewritten = route ? route.rewrittenUrl : opts.upstream + (req.url ?? "");
+    const reqUrl = req.url ?? "";
+    const isAbsoluteUrl = /^https?:\/\//i.test(reqUrl);
+    const rewritten = route ? route.rewrittenUrl : isAbsoluteUrl ? reqUrl : opts.upstream + reqUrl;
     const upstreamUrl = rewritten.replace(/^mitm:\/\//, "https://");
     // Usage-ledger capture context: model from the request body, provider from
     // the resolved upstream host.
@@ -1174,11 +1270,27 @@ async function forward(
         } catch { /* best-effort */ }
     }
     const headers: Record<string, string> = {};
+    const reqConnNamed = connectionNamedHeaders(req.headers["connection"]);
     for (const [k, v] of Object.entries(req.headers)) {
-        if (UPSTREAM_HOP_HEADERS.has(k.toLowerCase()) || v === undefined) continue;
+        const lower = k.toLowerCase();
+        if (UPSTREAM_HOP_HEADERS.has(lower) || reqConnNamed.has(lower) || v === undefined) continue;
         headers[k] = Array.isArray(v) ? v.join(", ") : v;
     }
-    headers["host"] = new URL(route ? route.upstream : opts.upstream).host;
+    headers["host"] = new URL(upstreamUrl).host;
+    // codex advertises its own server-side context compaction via this beta
+    // feature. It conflicts with bili's client-side compress (bili IS the
+    // compression layer) and third-party aggregators reject it with
+    // "invalid range / ref not found". Strip it so bili's compress is the
+    // sole mechanism.
+    const betaKey = Object.keys(headers).find((h) => h.toLowerCase() === "x-codex-beta-features");
+    if (betaKey) {
+        const kept = headers[betaKey]
+            .split(",")
+            .map((s) => s.trim())
+            .filter((f) => f && f !== "remote_compaction_v2");
+        if (kept.length > 0) headers[betaKey] = kept.join(",");
+        else delete headers[betaKey];
+    }
     // Forward a client-provided Responses session identity only when it was
     // carried in the body rather than an existing request header.
     if (affinity && !clientConversationHeader(req.headers)) {
@@ -1191,6 +1303,41 @@ async function forward(
             if (typeof hv === "string") hdrLog[hk] = hv.length > 200 ? hv.slice(0, 200) + "..." : hv;
         }
         log("info", `[${prepared?.session.id ?? "unknown"}] → upstream headers: ${JSON.stringify(hdrLog)}`);
+    }
+    // Raw HTTP capture: dump the COMPLETE exchange (request method/URL/all
+    // headers/exact body bytes; response status+headers) so two consecutive
+    // requests can be byte-diffed to locate a cache-breaker that the JSON body
+    // dump (which re-formats and omits headers) may hide. Enabled with --debug
+    // (headers written verbatim minus credential values).
+    const rawBase =
+        opts.debug
+            ? (() => {
+                  try {
+                      const rawDir = process.env.ACP_RAW_DUMP_DIR || `${stateDir()}/raw`;
+                      fs.mkdirSync(rawDir, { recursive: true });
+                      return `${rawDir}/${Date.now()}-${prepared?.session.id ?? "unknown"}`;
+                  } catch {
+                      return "";
+                  }
+              })()
+            : "";
+    if (rawBase) {
+        try {
+            const maskHdr = (k: string, v: string) =>
+                /key|auth|token/i.test(k) ? `<masked ${v.length} chars>` : v;
+            const hdrText = Object.entries(headers)
+                .map(([k, v]) => `${k}: ${maskHdr(k, String(v))}`)
+                .join("\n");
+            const bodyText =
+                req.method === "GET" || req.method === "HEAD"
+                    ? ""
+                    : typeof body === "string"
+                      ? body
+                      : Buffer.from(body).toString("utf8");
+            const reqPath = `${rawBase}-REQ.txt`;
+            fs.writeFileSync(reqPath, `${req.method ?? "POST"} ${upstreamUrl}\n${hdrText}\n\n${bodyText}`);
+            log("info", `[debug] RAW request dump: ${reqPath}`);
+        } catch { /* best-effort */ }
     }
     const dispatcher = proxyDispatcher(proxyUrl);
     const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
@@ -1209,17 +1356,32 @@ async function forward(
     }
     const { response: upstream, clearTimer: clearUpstreamTimer } = upstreamResult;
     const respHeaders: Record<string, string> = {};
+    const respConnNamed = connectionNamedHeaders(upstream.headers.get("connection") ?? undefined);
     upstream.headers.forEach((v, k) => {
-        if (UPSTREAM_HOP_HEADERS.has(k.toLowerCase())) return;
+        const lower = k.toLowerCase();
+        if (UPSTREAM_HOP_HEADERS.has(lower) || respConnNamed.has(lower)) return;
         respHeaders[k] = v;
     });
     if (opts.debug) {
         const respLog: Record<string, string> = {};
         upstream.headers.forEach((v, k) => {
-            if (UPSTREAM_HOP_HEADERS.has(k.toLowerCase())) return;
+            const lower = k.toLowerCase();
+            if (UPSTREAM_HOP_HEADERS.has(lower) || respConnNamed.has(lower)) return;
             respLog[k] = v.length > 300 ? v.slice(0, 300) + "..." : v;
         });
         log("info", `[${prepared?.session.id ?? "unknown"}] ← upstream response headers: ${JSON.stringify(respLog)}`);
+    }
+    if (rawBase) {
+        try {
+            const maskHdr = (k: string, v: string) =>
+                /key|auth|token/i.test(k) ? `<masked ${v.length} chars>` : v;
+            const hdrText = Object.entries(respHeaders)
+                .map(([k, v]) => `${k}: ${maskHdr(k, v)}`)
+                .join("\n");
+            const resPath = `${rawBase}-RES.txt`;
+            fs.writeFileSync(resPath, `${upstream.status}\n${hdrText}\n`);
+            log("info", `[debug] RAW response dump: ${resPath}`);
+        } catch { /* best-effort */ }
     }
     // P1.2: if the upstream returned a non-2xx (auth, rate-limit, context too
     // long, ...), do NOT route the error body through the SSE rewriter — it has
@@ -1284,23 +1446,21 @@ async function forward(
         // emitStreamError sends a protocol-appropriate error + finish so the
         // client ends cleanly instead of seeing a bare truncated stream.
         try {
-        if (process.env.ACP_LOOP_V2 !== "0") {
             const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
-            const reqHeaders: Record<string, string> = {};
-            for (const [k, v] of Object.entries(headers)) {
-                if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
-                reqHeaders[k] = v;
-            }
-            reqHeaders["content-type"] = "application/json";
+            const reqHeaders = buildForwardHeaders(headers);
             const textProtocol = prepared.protocol === "responses" && !!prepared.responsesTextProtocol;
             const workflowOptions = opts.workflow ?? DEFAULT_WORKFLOW_OPTIONS;
             const systemPrompts: string[] = [];
             if (opts.compress.injectTool) {
-                systemPrompts.push(textProtocol ? buildCompressTextSystemPrompt() : buildCompressSystemPrompt());
+                systemPrompts.push(textProtocol ? buildCompressHybridSystemPrompt() : buildCompressSystemPrompt());
             }
             if (workflowOptions.enabled) systemPrompts.push(buildWorkflowSystemPrompt(textProtocol));
             const systemPrompt = systemPrompts.join("\n\n---\n\n");
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem);
+            const abortCtrl = new AbortController();
+            req.on("close", () => {
+                if (!res.writableEnded) abortCtrl.abort();
+            });
             const loop = runCompressLoop(
                 streamToRead,
                 {
@@ -1312,6 +1472,7 @@ async function forward(
                     proxyUrl,
                     textProtocol,
                     debug: opts.debug,
+                    nudge: prepared.nudge,
                     workflowOptions,
                     ...(prepared.protocol === "responses" && workflowOptions.enabled ? {
                         refreshWorkflowRequest: async (requestBody: Record<string, unknown>) => {
@@ -1334,6 +1495,7 @@ async function forward(
                 { url: upstreamUrl, headers: reqHeaders },
                 adapter,
                 systemPrompt,
+                abortCtrl.signal,
             );
             for await (const chunk of loop) {
                 {
@@ -1343,80 +1505,15 @@ async function forward(
                     }
                 }
                 res.write(chunk);
-                if (res.writableNeedDrain) await new Promise<void>((r) => res.once("drain", () => r()));
+                if (res.writableNeedDrain) {
+                    await Promise.race([
+                        new Promise<void>((r) => res.once("drain", () => r())),
+                        new Promise<void>((r) => res.once("close", () => r())),
+                    ]);
+                }
+                if (res.destroyed || res.writableEnded) break;
             }
             res.end();
-        } else if (prepared.protocol === "openai") {
-            const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
-            const reqHeaders: Record<string, string> = {};
-            for (const [k, v] of Object.entries(headers)) {
-                if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
-                reqHeaders[k] = v;
-            }
-            reqHeaders["content-type"] = "application/json";
-            const loop = compressLoopStream(
-                streamToRead,
-                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, usage: usageCapture },
-                parsedReq,
-                { url: upstreamUrl, headers: reqHeaders },
-            );
-            for await (const chunk of loop) {
-                {
-                    const s = chunk.toString("utf8");
-                    if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
-                        log("warn", `[${prepared.session.id}] tag echo: openai response stream contains <acp tag`);
-                    }
-                }
-                if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
-            }
-        } else if (prepared.protocol === "responses") {
-            const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
-            const reqHeaders: Record<string, string> = {};
-            for (const [k, v] of Object.entries(headers)) {
-                if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
-                reqHeaders[k] = v;
-            }
-            reqHeaders["content-type"] = "application/json";
-            const loop = compressLoopResponsesStream(
-                streamToRead,
-                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: prepared.responsesTextProtocol, usage: usageCapture, workflowOptions: opts.workflow },
-                parsedReq,
-                { url: upstreamUrl, headers: reqHeaders },
-            );
-            for await (const chunk of loop) {
-                {
-                    const s = chunk.toString("utf8");
-                    if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
-                        log("warn", `[${prepared.session.id}] tag echo: responses response stream contains <acp tag`);
-                    }
-                }
-                if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
-            }
-        } else {
-            const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
-            const reqHeaders: Record<string, string> = {};
-            for (const [k, v] of Object.entries(headers)) {
-                if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
-                reqHeaders[k] = v;
-            }
-            reqHeaders["content-type"] = "application/json";
-            const loop = compressLoopAnthropicStream(
-                streamToRead,
-                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, usage: usageCapture },
-                parsedReq,
-                { url: upstreamUrl, headers: reqHeaders },
-            );
-            for await (const chunk of loop) {
-                {
-                    const s = chunk.toString("utf8");
-                    if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
-                        log("warn", `[${prepared.session.id}] tag echo: anthropic response stream contains <acp tag`);
-                    }
-                }
-                if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
-            }
-        }
-        res.end();
         } catch (e) {
             emitStreamError(res, prepared.protocol, (e as Error)?.message ?? String(e), (m) => log("error", `[${prepared.session.id}] ${m}`));
         } finally {
@@ -1434,36 +1531,15 @@ async function forward(
             const text = Buffer.from(buf).toString("utf8");
             try {
                 let json = JSON.parse(text) as Record<string, unknown>;
-                if (prepared.protocol === "openai" || prepared.protocol === "anthropic" || prepared.protocol === "responses") {
+                if (prepared.protocol === "responses") {
                     const requestBody = JSON.parse(typeof body === "string" ? body : body.toString("utf8")) as Record<string, unknown>;
-                    const requestHeaders: Record<string, string> = {};
-                    for (const [key, value] of Object.entries(headers)) {
-                        if (key.toLowerCase() === "content-length" || key.toLowerCase() === "host") continue;
-                        requestHeaders[key] = value;
-                    }
-                    requestHeaders["content-type"] = "application/json";
-                    if (prepared.protocol === "openai") {
-                        json = await compressLoopJson(
-                            json,
-                            { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, usage: usageCapture },
-                            requestBody,
-                            { url: upstreamUrl, headers: requestHeaders },
-                        );
-                    } else if (prepared.protocol === "anthropic") {
-                        json = await compressLoopAnthropicJson(
-                            json,
-                            { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, usage: usageCapture },
-                            requestBody,
-                            { url: upstreamUrl, headers: requestHeaders },
-                        );
-                    } else {
-                        json = await compressLoopResponsesJson(
-                            json,
-                            { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: prepared.responsesTextProtocol, usage: usageCapture, workflowOptions: opts.workflow },
-                            requestBody,
-                            { url: upstreamUrl, headers: requestHeaders },
-                        );
-                    }
+                    const requestHeaders = buildForwardHeaders(headers);
+                    json = await compressLoopResponsesJson(
+                        json,
+                        { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: prepared.responsesTextProtocol, usage: usageCapture, workflowOptions: opts.workflow },
+                        requestBody,
+                        { url: upstreamUrl, headers: requestHeaders },
+                    );
                 }
                 // Capture upstream usage so tokenCount (which drives nudge +
                 // emergency-truncate) reflects reality for non-streaming
@@ -1547,6 +1623,7 @@ async function dumpStreamToFile(stream: ReadableStream<Uint8Array>, dir: string,
     try {
         mkdirSync(dir, { recursive: true });
         const ws = createWriteStream(join(dir, name));
+        ws.on("error", (e) => { loggerLog("debug", `[dump] write stream error: ${(e as Error).message ?? e}`); });
         const reader = stream.getReader();
         try {
             for (;;) {
@@ -1657,9 +1734,10 @@ function headerValue(req: http.IncomingMessage, name: string): string | undefine
     return undefined;
 }
 
-/** A thrown BodyTooLargeError lets handle() respond 413 cleanly before
- *  destroying the request. Avoids a bare req.destroy() that would reject
- *  readBody but leave the client connection with no HTTP response. */
+/** Thrown by readBody when the request body exceeds MAX_REQUEST_BYTES.
+ *  handle() catches this and attempts a 413 response; readBody also destroys
+ *  the request socket so a client that keeps streaming a pathological body
+ *  cannot hold the connection open. */
 export class BodyTooLargeError extends Error {
     constructor(public readonly limit: number) {
         super(`request body exceeds ${limit} bytes`);
@@ -1677,9 +1755,7 @@ export function readBody(req: http.IncomingMessage): Promise<Buffer> {
             size += c.length;
             if (size > MAX_REQUEST_BYTES) {
                 aborted = true;
-                // Reject FIRST so handle() can write a 413 and return.
-                // Then drain remaining data so the socket can close
-                // cleanly instead of lingering mid-request.
+                req.destroy();
                 reject(new BodyTooLargeError(MAX_REQUEST_BYTES));
                 return;
             }

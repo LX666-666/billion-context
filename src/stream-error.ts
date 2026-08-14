@@ -5,7 +5,7 @@ import type http from "node:http";
  * failure and ends cleanly, instead of a bare socket close.
  *
  * WHY: server.ts forward() routes streams through protocol rewriters
- * (rewriteSseStream / compressLoopStream / compressLoopResponsesStream). If a
+ * (rewriteSseStream / runCompressLoop). If a
  * rewriter throws (e.g. executeProxyTool hits an edge case, JSON.parse fails),
  * the `for await` loop aborts and — without this — `res.end()` is skipped,
  * leaving the client with a truncated stream and no finish event. The request
@@ -40,8 +40,20 @@ export function emitStreamError(res: http.ServerResponse, protocol: Protocol, me
             safeWrite(res, `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
             safeWrite(res, "data: [DONE]\n\n");
         } else if (protocol === "responses") {
-            safeWrite(res, `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: visible })}\n\n`);
-            safeWrite(res, `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [] } })}\n\n`);
+            // Responses requires a full item lifecycle: output_item.added →
+            // content_part.added → output_text.delta → …done → item.done →
+            // completed. A bare delta (the old shape) is orphan + malformed
+            // (no item_id) and crashes strict clients (codex/gpt-5-codex).
+            const itemId = "msg_acp_error";
+            const oi = 0;
+            const errorItem = { type: "message", id: itemId, role: "assistant", content: [{ type: "output_text", text: visible }] };
+            safeWrite(res, `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", output_index: oi, item: { type: "message", id: itemId, role: "assistant", content: [] } })}\n\n`);
+            safeWrite(res, `event: response.content_part.added\ndata: ${JSON.stringify({ type: "response.content_part.added", item_id: itemId, output_index: oi, part: { type: "output_text", text: "" } })}\n\n`);
+            safeWrite(res, `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", item_id: itemId, output_index: oi, delta: visible })}\n\n`);
+            safeWrite(res, `event: response.output_text.done\ndata: ${JSON.stringify({ type: "response.output_text.done", item_id: itemId, output_index: oi, text: visible })}\n\n`);
+            safeWrite(res, `event: response.content_part.done\ndata: ${JSON.stringify({ type: "response.content_part.done", item_id: itemId, output_index: oi, part: { type: "output_text", text: visible } })}\n\n`);
+            safeWrite(res, `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: oi, item: errorItem })}\n\n`);
+            safeWrite(res, `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [errorItem] } })}\n\n`);
         } else {
             // anthropic
             safeWrite(res, `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: visible } })}\n\n`);

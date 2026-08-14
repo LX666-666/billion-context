@@ -1,12 +1,15 @@
 import {
     buildStatusReport,
     estimateTokensFast,
+    formatRanges,
     hideConsumedCompressCalls,
     type CompressionCore,
     type Config,
     type CoreMessage,
+    type NudgeDecision,
 } from "acp-kernel";
 import { markDirty, type Session } from "../session.js";
+import type { BiliMessage } from "../bili-message.js";
 import {
     parseCompressInput,
     PROXY_TOOL_NAMES,
@@ -41,6 +44,7 @@ export interface LoopCtx {
         requestBody: Record<string, unknown>;
         messages: CoreMessage[];
     }>;
+    nudge?: NudgeDecision;
 }
 
 export interface RequestOptions {
@@ -50,7 +54,8 @@ export interface RequestOptions {
 
 export type ParsedStreamEvent =
     | { kind: "text"; delta: string; raw?: Buffer }
-    | { kind: "tool_call"; name: string; callId: string; arguments: string }
+    | { kind: "reasoning"; delta: string; raw?: Buffer; signature?: string; blockEnd?: boolean }
+    | { kind: "tool_call"; name: string; callId: string; arguments: string; passthrough?: boolean }
     | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number }
     | { kind: "done"; finishReason?: string }
     | { kind: "meta"; chunk: Buffer; firstRoundOnly?: boolean };
@@ -64,6 +69,7 @@ export interface ToolCallEmit {
     name: string;
     callId: string;
     arguments: string;
+    passthrough?: boolean;
 }
 
 export interface ExtractedTextTriggers {
@@ -80,6 +86,7 @@ export interface CompressLoopAdapter {
     ): Record<string, unknown>;
     parseStream(upstream: ReadableStream<Uint8Array>, round: number): AsyncGenerator<ParsedStreamEvent>;
     emitText(delta: string): Buffer;
+    emitReasoning?(delta: string): Buffer;
     emitToolCall(call: ToolCallEmit): Buffer;
     emitMarker(toolName: string, result: string): Buffer;
     emitCompletion(opts?: EmitCompletionOpts): Buffer;
@@ -113,7 +120,7 @@ export function executeProxyTool(
         return `Found ${blocks.length} block(s) for "${query}":\n\n${lines.join("\n\n")}`;
     }
     if (toolName === "acp_status") {
-        return buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast);
+        return handleAcpStatus(args, ctx);
     }
     if (toolName === "workflow_checkpoint") {
         const options = ctx.workflowOptions ?? DEFAULT_WORKFLOW_OPTIONS;
@@ -150,6 +157,32 @@ export function executeProxyTool(
     return `[Unknown proxy tool: ${toolName}]`;
 }
 
+// Aligns with billion-context-pi's handleStatus: appends compressible ranges
+// to the default overview so the model picks valid refs (else it guesses
+// covered/protected refs → 0-char compress failures).
+function handleAcpStatus(args: Record<string, unknown>, ctx: LoopCtx): string {
+    const scope = typeof args.scope === "string" ? (args.scope as "compressed" | "uncompressed") : undefined;
+    const view = typeof args.view === "string" ? (args.view as "ranges" | "messages") : undefined;
+    const tool = typeof args.tool === "string" ? args.tool : undefined;
+    const sort = typeof args.sort === "string" ? (args.sort as "size" | "time" | "tool" | "age") : undefined;
+    const limit = typeof args.limit === "number" ? args.limit : undefined;
+    const base = buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast, { scope, view, tool, sort, limit });
+    if (scope) return base;
+    const nudge = ctx.nudge;
+    const ranges = nudge?.compressibleRanges ?? [];
+    const protectedRanges = nudge?.protectedRanges ?? [];
+    const extra: string[] = [];
+    if (nudge) {
+        extra.push("");
+        extra.push(nudge.shouldInject ? `Nudge: ACTIVE — ${nudge.reason}` : `Nudge: idle — ${nudge.reason}`);
+    }
+    if (ranges.length > 0 || protectedRanges.length > 0) {
+        extra.push("");
+        extra.push(formatRanges(ranges, protectedRanges));
+    }
+    return extra.length > 0 ? `${base}\n${extra.join("\n")}` : base;
+}
+
 function recordUsage(
     ctx: LoopCtx,
     usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number },
@@ -164,9 +197,11 @@ function recordUsage(
         + (!inputIncludesCached && typeof cached === "number" ? cached : 0);
     ctx.session.stats.lastInputTokens = totalInput;
     recordWorkflowUsage(ctx.session.workflow, totalInput, cached);
-    if (typeof cached === "number") ctx.session.stats.cachedTokens += cached;
+    if (typeof cached === "number") {
+        ctx.session.stats.cachedTokens += cached;
+        ctx.session.stats.cacheSamples += 1;
+    }
     if (typeof out === "number") ctx.session.stats.outputTokens += out;
-    ctx.session.stats.cacheSamples += 1;
     const hitPct =
         typeof cached === "number" && totalInput > 0
             ? Math.round((cached / totalInput) * 100)
@@ -183,6 +218,7 @@ export async function* runCompressLoop(
     requestOptions: RequestOptions,
     adapter: CompressLoopAdapter,
     systemPrompt: string,
+    signal?: AbortSignal,
 ): AsyncGenerator<Buffer> {
     let activeClearTimer: (() => void) | null = null;
     let currentUpstream = upstream;
@@ -190,19 +226,44 @@ export async function* runCompressLoop(
 
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
+            if (signal?.aborted) break;
             let assistantText = "";
+            let assistantReasoning = "";
+            const reasoningSegments: { text: string; signature: string }[] = [];
+            let reasoningSealed = true;
             const calls: ToolCallEmit[] = [];
             let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number } = {};
             let finishReason: string | undefined;
 
             for await (const ev of adapter.parseStream(currentUpstream, round)) {
-                if (ev.kind === "text") {
-                    assistantText += ev.delta;
-                    if (!ctx.textProtocol && round === 1 && ev.raw) {
-                        yield ev.raw;
-                    }
-                } else if (ev.kind === "tool_call") {
-                    calls.push({ name: ev.name, callId: ev.callId, arguments: ev.arguments });
+                if (signal?.aborted) break;
+                    if (ev.kind === "text") {
+                        assistantText += ev.delta;
+                        if (!ctx.textProtocol && ev.raw) {
+                            yield ev.raw;
+                        } else if (!ctx.textProtocol && round > 1 && ev.delta.length > 0) {
+                            yield adapter.emitText(ev.delta);
+                        }
+                    } else if (ev.kind === "reasoning") {
+                        assistantReasoning += ev.delta;
+                        let seg = reasoningSegments[reasoningSegments.length - 1];
+                        if (reasoningSealed || !seg) {
+                            seg = { text: "", signature: "" };
+                            reasoningSegments.push(seg);
+                            reasoningSealed = false;
+                        }
+                        seg.text += ev.delta;
+                        if (ev.signature) seg.signature += ev.signature;
+                        if (ev.blockEnd) reasoningSealed = true;
+                        if (!ctx.textProtocol) {
+                            if (ev.raw) {
+                                yield ev.raw;
+                            } else if (round > 1 && ev.delta.length > 0 && adapter.emitReasoning) {
+                                yield adapter.emitReasoning(ev.delta);
+                            }
+                        }
+                    } else if (ev.kind === "tool_call") {
+                    calls.push({ name: ev.name, callId: ev.callId, arguments: ev.arguments, passthrough: ev.passthrough });
                 } else if (ev.kind === "usage") {
                     usage = {
                         inputTokens: ev.inputTokens,
@@ -233,10 +294,9 @@ export async function* runCompressLoop(
                 resolvedText = extracted.clean;
                 allCalls = [...calls, ...extracted.calls];
             }
+            const functionCallIds = new Set(calls.map(c => c.callId));
 
             if (ctx.textProtocol && resolvedText.length > 0) {
-                yield adapter.emitText(resolvedText);
-            } else if (!ctx.textProtocol && round > 1 && resolvedText.length > 0) {
                 yield adapter.emitText(resolvedText);
             }
 
@@ -279,23 +339,31 @@ export async function* runCompressLoop(
             // never in coreMessages), and hideConsumedCompressCalls runs each
             // round so consumed compress records cannot re-prime the model.
             if (proxyResults.length > 0) {
-                if (resolvedText.length > 0) {
+                if (reasoningSegments.length > 0) {
+                    for (let i = 0; i < reasoningSegments.length; i++) {
+                        const seg = reasoningSegments[i];
+                        if (seg.text.length === 0 && seg.signature.length === 0) continue;
+                        const reasoningMsg: BiliMessage = {
+                            id: i === 0 ? `acp_loop_r${round}_reasoning` : `acp_loop_r${round}_reasoning_${i + 1}`,
+                            role: "assistant",
+                            contentType: "reasoning",
+                            text: seg.text,
+                            reasoningContent: seg.text,
+                            ...(seg.signature.length > 0 ? { thinkingSignature: seg.signature } : {}),
+                        };
+                        coreMessages.push(reasoningMsg);
+                    }
+                }
+                if (assistantText.length > 0) {
                     coreMessages.push({
                         id: `acp_loop_r${round}_asst`,
                         role: "assistant",
                         contentType: "text",
-                        text: resolvedText,
+                        text: assistantText,
                     });
                 }
                 for (const pr of proxyResults) {
-                    if (ctx.textProtocol) {
-                        coreMessages.push({
-                            id: `acp_loop_r${round}_marker_${pr.callId}`,
-                            role: "assistant",
-                            contentType: "text",
-                            text: buildWorkflowResultText(pr.name, buildVisibilityMarker(pr.name, pr.result)),
-                        });
-                    } else {
+                    if (functionCallIds.has(pr.callId)) {
                         coreMessages.push({
                             id: `acp_loop_r${round}_asst_tc_${pr.callId}`,
                             role: "assistant",
@@ -311,9 +379,26 @@ export async function* runCompressLoop(
                             toolCallId: pr.callId,
                             text: pr.result,
                         });
+                    } else if (ctx.textProtocol) {
+                        coreMessages.push({
+                            id: `acp_loop_r${round}_marker_${pr.callId}`,
+                            role: "assistant",
+                            contentType: "text",
+                            text: buildWorkflowResultText(pr.name, buildVisibilityMarker(pr.name, pr.result)),
+                        });
+                    } else {
+                        coreMessages.push({
+                            id: `acp_loop_r${round}_marker_${pr.callId}`,
+                            role: "system",
+                            contentType: "text",
+                            text: buildVisibilityMarker(pr.name, pr.result),
+                        });
                     }
                 }
-                if (!ctx.textProtocol) {
+                const anyCompressFailed = proxyResults.some(
+                    (pr) => (pr.name === "compress" || pr.name === "decompress") && pr.result.includes("FAILED"),
+                );
+                if (!ctx.textProtocol && !anyCompressFailed) {
                     const hidden = hideConsumedCompressCalls(ctx.session.state, coreMessages);
                     if (hidden.hidden > 0) {
                         ctx.log(`[acp-loop] round ${round} hideConsumed hid ${hidden.hidden} compress record(s)`);
@@ -324,6 +409,7 @@ export async function* runCompressLoop(
             }
 
             for (const tc of realToolCalls) {
+                if (tc.passthrough) continue;
                 yield adapter.emitToolCall(tc);
             }
 
@@ -347,7 +433,9 @@ export async function* runCompressLoop(
                 return;
             }
 
-            ctx.log(`[acp-loop] round ${round} saw mutating proxy tool; re-requesting`);
+            ctx.log(`[acp-loop] round ${round}: proxy tool executed; re-requesting so the model sees the result`);
+
+            if (signal?.aborted) break;
 
             let newBody = adapter.buildRequest(coreMessages, systemPrompt, requestBody);
             const workflowStateChanged = proxyResults.some((result) =>
@@ -370,12 +458,17 @@ export async function* runCompressLoop(
                     fs.writeFileSync(`${dumpDir}/req-${Date.now()}-${sid}-REREQUEST.json`, JSON.stringify(newBody, null, 2));
                 } catch { /* best-effort */ }
             }
-            const { response: resp, clearTimer } = await fetchWithTimeout(requestOptions.url, {
-                method: "POST",
-                headers: requestOptions.headers,
-                body: JSON.stringify(newBody),
-                ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
-            });
+            const { response: resp, clearTimer } = await fetchWithTimeout(
+                requestOptions.url,
+                {
+                    method: "POST",
+                    headers: requestOptions.headers,
+                    body: JSON.stringify(newBody),
+                    ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
+                },
+                undefined,
+                signal,
+            );
 
             if (!resp.ok || !resp.body) {
                 clearTimer();
