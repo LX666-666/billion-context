@@ -8,6 +8,13 @@ export type CodexUpdatePlanCall = {
     index: number;
 };
 
+export type CodexNestedCall = {
+    callId: string;
+    name: string;
+    argumentsText: string;
+    index: number;
+};
+
 function isPlanStatus(value: unknown): value is PlanStepStatus {
     return value === "pending" || value === "in_progress" || value === "completed";
 }
@@ -243,17 +250,17 @@ function planArguments(value: unknown): string | undefined {
     });
 }
 
-function invocationAt(source: string, index: number): { openIndex: number; endIndex: number } | undefined {
-    const match = /^tools\s*\.\s*update_plan\s*\(/.exec(source.slice(index));
+function invocationAt(source: string, index: number): { name: string; openIndex: number; endIndex: number } | undefined {
+    const match = /^tools\s*\.\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/.exec(source.slice(index));
     if (!match) return undefined;
     const openIndex = index + match[0].length - 1;
     const argumentsText = balancedCallArguments(source, openIndex);
     if (argumentsText === undefined) return undefined;
-    return { openIndex, endIndex: openIndex + argumentsText.length + 2 };
+    return { name: match[1] ?? "", openIndex, endIndex: openIndex + argumentsText.length + 2 };
 }
 
-export function extractCodexUpdatePlanCalls(outerCallId: string, source: string): CodexUpdatePlanCall[] {
-    const calls: CodexUpdatePlanCall[] = [];
+function scanCodexNestedCalls(outerCallId: string, source: string): CodexNestedCall[] {
+    const calls: CodexNestedCall[] = [];
     let quote: "\"" | "'" | "`" | undefined;
     let escaped = false;
     let lineComment = false;
@@ -297,22 +304,42 @@ export function extractCodexUpdatePlanCalls(outerCallId: string, source: string)
         if (!invocation) continue;
         const argumentsText = balancedCallArguments(source, invocation.openIndex);
         if (argumentsText === undefined) continue;
+        let normalized = argumentsText.trim();
         try {
             const parsed = new RestrictedValueParser(argumentsText).parse();
-            const normalized = planArguments(parsed);
-            if (!normalized) continue;
-            const planIndex = calls.length;
-            calls.push({
-                callId: `${outerCallId}:update_plan:${planIndex}`,
-                argumentsText: normalized,
-                index: planIndex,
-            });
+            normalized = JSON.stringify(parsed);
         } catch {
-            continue;
         }
+        const occurrence = calls.filter((call) => call.name === invocation.name).length;
+        calls.push({
+            callId: `${outerCallId}:${invocation.name}:${occurrence}`,
+            name: invocation.name,
+            argumentsText: normalized,
+            index: calls.length,
+        });
         index = invocation.endIndex - 1;
     }
     return calls;
+}
+
+export function extractCodexNestedCalls(outerCallId: string, source: string): CodexNestedCall[] {
+    return scanCodexNestedCalls(outerCallId, source);
+}
+
+export function extractCodexUpdatePlanCalls(outerCallId: string, source: string): CodexUpdatePlanCall[] {
+    return scanCodexNestedCalls(outerCallId, source)
+        .filter((call) => call.name === "update_plan")
+        .flatMap((call, index) => {
+            try {
+                const parsed = new RestrictedValueParser(call.argumentsText).parse();
+                const normalized = planArguments(parsed);
+                return normalized
+                    ? [{ callId: `${outerCallId}:update_plan:${index}`, argumentsText: normalized, index }]
+                    : [];
+            } catch {
+                return [];
+            }
+        });
 }
 
 export function containsCodexUpdatePlan(source: string): boolean {

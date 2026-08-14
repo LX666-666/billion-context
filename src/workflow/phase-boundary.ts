@@ -6,6 +6,11 @@ import { isWorkflowMessage } from "./workflow-item.js";
 
 const EXPLICIT_SWITCH = /(?:\b(?:switch|move on to|move to|start(?: work)? on|begin(?: work)? on|focus on|work on)\s+(?:the\s+)?(?:next|another|new|different|phase|task|step|target)\b|\b(?:next|another|new|different)\s+(?:phase|task|step|target|feature)\b|\b(?:this|that)\s+(?:is\s+)?(?:done|complete|finished)\b\s*(?:,|;|and|so)?\s*(?:now|next|then|let'?s|we can|I will)?\s*(?:switch|move|start|work|focus)\b)|(?:这个好了|这部分好了|已经完成|已完成|完成了).{0,40}(?:现在|接下来|然后).{0,20}(?:改|处理|开始|切换|转到|另一个|下一个)/i;
 
+export type FallbackOperationDecision =
+    | "CONTINUE_CURRENT_PHASE"
+    | "CLOSE_AND_START_NEW_PHASE"
+    | "WAIT_FOR_PLAN_SYNC";
+
 function closeCandidate(state: WorkflowState): void {
     const phaseId = state.activePhaseId;
     if (!phaseId) return;
@@ -28,6 +33,10 @@ function phaseHasSuccessfulValidation(state: WorkflowState, phaseId: string): bo
         const operation = state.operations[opId];
         return Boolean(operation && (operation.type === "TEST" || operation.type === "BUILD" || operation.type === "RUN") && operation.outcome === "PASS");
     }) ?? false;
+}
+
+function hasActivePlan(state: WorkflowState): boolean {
+    return state.activePlan?.items.some((item) => item.status === "in_progress") ?? false;
 }
 
 function targetChanged(state: WorkflowState, phaseId: string, operation: OperationRecord): boolean {
@@ -57,11 +66,12 @@ export function observePhaseBoundaryFallback(state: WorkflowState, messages: Bil
     };
 }
 
-export function beforeFallbackOperation(state: WorkflowState, operation: OperationRecord): void {
+export function beforeFallbackOperation(state: WorkflowState, operation: OperationRecord): FallbackOperationDecision {
     const activePhaseId = state.activePhaseId;
     const candidate = state.phaseBoundaryCandidate;
-    if (!activePhaseId) return;
+    if (!activePhaseId) return "CONTINUE_CURRENT_PHASE";
     if (!candidate && phaseHasSuccessfulValidation(state, activePhaseId) && targetChanged(state, activePhaseId, operation)) {
+        if (hasActivePlan(state)) return "WAIT_FOR_PLAN_SYNC";
         state.phaseBoundaryCandidate = {
             phaseId: activePhaseId,
             reason: "new target after successful validation without update_plan",
@@ -69,11 +79,19 @@ export function beforeFallbackOperation(state: WorkflowState, operation: Operati
             sourceMessageRef: `operation:${operation.opId}`,
             sourceRevision: state.activePlan?.revision ?? 0,
         };
-        return;
+        closeCandidate(state);
+        return "CLOSE_AND_START_NEW_PHASE";
     }
-    if (!candidate || candidate.phaseId !== activePhaseId) return;
-    if (!phaseHasSuccessfulValidation(state, activePhaseId) && !candidate.reason.includes("explicit")) return;
-    if (targetChanged(state, activePhaseId, operation) || candidate.reason.includes("explicit")) closeCandidate(state);
+    if (!candidate || candidate.phaseId !== activePhaseId) return "CONTINUE_CURRENT_PHASE";
+    if (!phaseHasSuccessfulValidation(state, activePhaseId) && !candidate.reason.includes("explicit")) {
+        return "CONTINUE_CURRENT_PHASE";
+    }
+    if (targetChanged(state, activePhaseId, operation) || candidate.reason.includes("explicit")) {
+        if (hasActivePlan(state)) return "WAIT_FOR_PLAN_SYNC";
+        closeCandidate(state);
+        return "CLOSE_AND_START_NEW_PHASE";
+    }
+    return "CONTINUE_CURRENT_PHASE";
 }
 
 export function phaseBoundaryCandidate(state: WorkflowState): boolean {

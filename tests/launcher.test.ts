@@ -553,8 +553,11 @@ test("preparePiHttpRewrite: rewrites matching provider, leaves others, symlinks 
         const out = JSON.parse(fs.readFileSync(path.join(tmp!, "models.json"), "utf8"));
         assert.equal(out.providers.a.baseUrl, "http://127.0.0.1:8787/bili/http://example.com/v1");
         assert.equal(out.providers.b.baseUrl, "https://secure.example.com");
-        assert.equal(fs.lstatSync(path.join(tmp!, "auth.json")).isSymbolicLink(), true);
-        assert.equal(fs.realpathSync(path.join(tmp!, "auth.json")), path.join(home, "auth.json"));
+        const authPath = path.join(tmp!, "auth.json");
+        assert.equal(fs.readFileSync(authPath, "utf8"), '{"key":"x"}');
+        if (fs.lstatSync(authPath).isSymbolicLink()) {
+            assert.equal(fs.realpathSync(authPath), path.join(home, "auth.json"));
+        }
     } finally {
         if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
         fs.rmSync(home, { recursive: true, force: true });

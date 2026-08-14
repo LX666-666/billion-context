@@ -1,9 +1,11 @@
 import type { BiliMessage } from "../bili-message.js";
 import { classifyOperation } from "./operation-classifier.js";
+import { observeOperationForSupervisor } from "./execution-supervisor.js";
 import { capturePhaseMessage, ensureActivePhase, recomputeWorkflowMetrics } from "./state.js";
 import { beforeFallbackOperation } from "./phase-boundary.js";
+import { observeRepositoryOperation } from "./repo-bridge.js";
 import { validationOutcome } from "./pruner/diagnostics.js";
-import type { OperationRecord, WorkflowState } from "./types.js";
+import type { CodexNestedOperation, OperationRecord, WorkflowOptions, WorkflowState } from "./types.js";
 
 export function trackOperationCall(
     state: WorkflowState,
@@ -30,6 +32,7 @@ export function trackOperationCall(
         ...(classification.workdir ? { workdir: classification.workdir } : {}),
         paths: classification.paths,
         addedPaths: classification.addedPaths,
+        ...(classification.codexNested ? { codexNested: classification.codexNested } : {}),
         rawTokens: 0,
         visibleTokens: 0,
         lifecycle: "ACTIVE",
@@ -37,8 +40,10 @@ export function trackOperationCall(
         createdAt: now,
         updatedAt: now,
     };
-    beforeFallbackOperation(state, operation);
-    const phase = ensureActivePhase(state, classification.type === "PLAN" ? "Planning" : "Unplanned work");
+    const fallbackDecision = beforeFallbackOperation(state, operation);
+    const phase = fallbackDecision === "CLOSE_AND_START_NEW_PHASE"
+        ? ensureActivePhase(state, classification.type === "PLAN" ? "Planning" : "Unplanned work")
+        : initialPhase;
     operation.phaseId = phase.phaseId;
     state.operations[opId] = operation;
     state.operationByCallId[callId] = opId;
@@ -83,6 +88,7 @@ export function updateOperationResult(
     }
     if (resultText !== undefined) operation.outcome = operationOutcome(operation.type, outcomeText ?? resultText);
     operation.updatedAt = Date.now();
+    observeOperationForSupervisor(state, operation);
     recomputeWorkflowMetrics(state);
 }
 
@@ -149,5 +155,35 @@ export function attachOperationMessageRefs(state: WorkflowState, messages: BiliM
         if (!operation) continue;
         const refs = message.role === "tool" ? operation.resultRefs : operation.callRefs;
         if (!refs.includes(message.id)) refs.push(message.id);
+    }
+}
+
+export function observeCodexNestedOperations(
+    state: WorkflowState,
+    operation: OperationRecord,
+    repoOptions: WorkflowOptions["repoBridge"],
+): void {
+    if (!operation.codexNested || operation.codexNested.length === 0) return;
+    for (const nested of operation.codexNested) {
+        if (nested.paths.length === 0 && nested.addedPaths.length === 0) continue;
+        const synthetic: OperationRecord = {
+            opId: `${operation.opId}#${nested.type}`,
+            phaseId: operation.phaseId,
+            type: nested.type,
+            callRefs: [],
+            resultRefs: [],
+            ...(operation.toolCallId ? { toolCallId: operation.toolCallId } : {}),
+            ...(nested.command ? { command: nested.command } : {}),
+            ...(operation.workdir ? { workdir: operation.workdir } : {}),
+            paths: nested.paths,
+            addedPaths: nested.addedPaths,
+            rawTokens: 0,
+            visibleTokens: 0,
+            lifecycle: "ACTIVE",
+            importance: "NORMAL",
+            createdAt: operation.createdAt,
+            updatedAt: operation.updatedAt,
+        };
+        observeRepositoryOperation(state, synthetic, repoOptions);
     }
 }

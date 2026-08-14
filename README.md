@@ -19,9 +19,9 @@ Agent (Claude Code / Codex / Cursor / Aider ...)
         │  you point the agent's base URL at the proxy
         ▼
 ┌─────────────────┐
-│  billion-context│   1. parse Anthropic / Chat / Responses requests
-│     proxy       │   2. prune large tool output before model ingest
-│                 │   3. run workflow GC + acp-kernel compression
+│  billion-context│   1. parse the request (Anthropic or OpenAI shape)
+│     proxy       │   2. run acp-kernel compression on the conversation
+│                 │   3. inject a `compress` tool + compression philosophy
 │                 │   4. forward to the real model API
 │                 │   5. rewrite the streaming response
 └─────────────────┘
@@ -30,19 +30,7 @@ Agent (Claude Code / Codex / Cursor / Aider ...)
    real model API (Anthropic / OpenAI / compatible)
 ```
 
-The proxy injects six context tools (`compress`, `decompress`, `search_context`, `acp_status`, `retrieve_raw`, and `expand_operation`). Responses clients also get `workflow_checkpoint`; Codex code mode uses an equivalent intercepted text protocol so its native tools remain available.
-
-### Workflow-aware context management
-
-- BUILD, TEST, RUN, INSTALL, SEARCH, LIST, JSON and JSONL output is cleaned and structured before it first reaches the expensive coding model. Exact failures, assertions, locations, crash signals and redacted environment clues are preserved; semantic raw output is archived and recoverable by `raw_ref`.
-- READ, PATCH, WRITE and DIFF content is never semantically pruned by a cheap model.
-- An optional OpenAI-compatible cheap pruner handles only still-large low-value tool output. It receives the current output, phase objective and a bounded requirement hint—not the full session—and falls back unchanged if protected diagnostic lines are lost.
-- Codex `update_plan` calls define phase boundaries. A completed phase is checkpointed, then its old read/patch/log working set is rolled over in one cache-aware batch.
-- Repo Bridge records the workspace/repository root, remote identity, HEAD, dirty state and file signatures. A phase boundary, HEAD change or external file change marks old reads stale; a mutation is blocked until Codex re-reads every affected current file.
-- The rollover scheduler weighs cache-hit ratio, context/tool growth, pending garbage, active debugging, prefix rewrite cost and expected next work. Small phase boundaries can defer GC without losing the pending-drop marker.
-- Project Memory distinguishes continuations from new tasks and compacts Phase → Session → Project checkpoints under a strict injection budget. The optional Cheap Historian only adds a bounded narrative from structured facts; it cannot replace exact requirements, decisions, errors or repository state.
-
-Codex Responses is the primary workflow adapter. Anthropic and OpenAI Chat share the same deterministic pre-ingest pruning core.
+The proxy injects four context-management tools (`compress`, `decompress`, `search_context`, `acp_status`) into the conversation. The model calls `compress` when the conversation grows, and the proxy executes it server-side — the compressed ranges are folded into the conversation history before the next turn.
 
 ## Install
 
@@ -73,9 +61,70 @@ Three ways to use it — pick one:
   or when you want to pin an exact value. Routing is the same `/bili/` prefix
   either way — the config only changes which context window the proxy uses.
 
-Core compression is injected automatically. Routing works without workflow
-configuration; the optional workflow, output-pruner model and historian can
-be tuned from the config file, environment variables or Web UI.
+Compression is injected automatically — you only configure routing, never
+compression itself.
+
+### Option 0 — Launcher (`bili pi` / `bili codex` / `bili claude`)
+
+The launcher wraps a client in one command: it starts a proxy on an
+independent port (reusing one already running there), then points the client
+at it via **certificate-based MITM** — no config files are edited. The client's
+own config is READ to discover which HTTPS upstream hosts it talks to; those
+hosts are whitelisted for MITM so the proxy can TLS-terminate exactly them and
+blind-tunnel everything else.
+
+```bash
+bili pi                               # launch pi through the proxy
+bili pi -- print "hi"                 # args after the client are passed through
+bili pi-test                          # clean pi (extensions off) — proxy owns compression, no double-compress
+bili codex                            # launch codex through the proxy
+bili claude                           # launch claude through the proxy
+bili test pi                          # quick end-to-end smoke test of the pi path
+bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
+```
+
+How the client is pointed at the proxy (set automatically in the child env):
+
+| Client      | Proxy redirect      | CA trust env var        |
+|-------------|---------------------|-------------------------|
+| pi          | `HTTPS_PROXY`       | `NODE_EXTRA_CA_CERTS`   |
+| claude      | `HTTPS_PROXY`       | `NODE_EXTRA_CA_CERTS`   |
+| codex       | `HTTPS_PROXY`       | `SSL_CERT_FILE`         |
+
+The real upstream HTTPS hosts are **discovered by reading** (never editing)
+the client's own config, so whatever you already have set up keeps working:
+
+| Client      | Read from                                    |
+|-------------|----------------------------------------------|
+| Pi          | `~/.pi/agent/models.json` — each provider's `baseUrl` |
+| Codex       | `~/.codex/config.toml` — each `[model_providers.<name>]` `base_url` (+ top-level `openai_base_url`) |
+| Claude Code | hardcoded `api.anthropic.com` (no per-config upstream) |
+
+Only **HTTPS** hosts are MITM'd (a self-signed CA can't intercept plaintext
+anyway); HTTP / `localhost` / `127.0.0.1` providers used to go direct, but are
+now auto-proxied too. Both schemes are covered with no config edits:
+
+- **HTTPS upstreams → cert MITM.** The MITM CA cert is the proxy's own root
+  (`~/.local/share/billion-context/ca/root-ca.pem`, generated lazily); the
+  client must trust it — pi/claude honor `NODE_EXTRA_CA_CERTS`, codex honors
+  `SSL_CERT_FILE`. Compression is injected on the intercepted TLS stream.
+- **HTTP upstreams → `/bili/` baseURL rewrite** (since plaintext can't be
+  MITM'd). The launcher rewrites the client's base URL through the client's own
+  mechanism, leaving its config files untouched: codex via `-c key=value` flags,
+  claude via the `ANTHROPIC_BASE_URL` env var, pi via an isolated
+  `PI_CODING_AGENT_DIR` pointing at a temp copy of the pi home with a rewritten
+  `models.json` (`auth.json` and the rest are symlinked through unchanged; the
+  temp dir is removed when the client exits).
+
+`--mitm-domain <domain>` (repeatable) adds extra domains to the whitelist
+beyond what auto-discovery finds — useful for hosts the client fetches at
+runtime rather than from its config file. The proxy port defaults to `8787`;
+if it's taken, a free port is chosen automatically. Use `--passthrough` /
+`--debug` / `--no-auto-update` just like plain `bili`.
+
+> **Note:** the launcher ties the proxy's lifetime to the client — when the
+> client exits, a proxy it started is stopped. If it reuses a proxy you already
+> started with plain `bili`, that one is left running.
 
 ### Option 0 — Launcher (`bili pi` / `bili codex` / `bili claude`)
 
@@ -295,11 +344,7 @@ block. **The key is the upstream URL** — the string the client puts after
 ### Option C — Web UI & context windows
 
 Open [http://localhost:8787/__bili/](http://localhost:8787/__bili/) to
-configure. The **Context** page exposes Workflow/Phase GC, the optional output
-compression model, Cheap Historian, Repo Bridge, the cache-aware scheduler and
-per-session telemetry. Saves hot-reload the running proxy. Model API keys are
-write-only: the UI can replace or clear them, but configuration reads never
-return their value.
+configure.
 
 ### Verify
 
@@ -411,44 +456,6 @@ with no file at all).
 | `BILI_PERSIST_DEBOUNCE_MS` | `500` | Debounce window for writes to disk (ms) |
 | `BILI_MAX_SESSIONS` | `256` | Max sessions held in memory (LRU eviction; disk is source of truth) |
 | `BILI_SESSIONS_DIR` | *(XDG data dir)* | Directory for persisted session state |
-| `BILI_WORKFLOW_ENABLED` | `1` | Enable workflow-aware context management |
-| `BILI_WORKFLOW_TARGET_RATIO` | `0.20` | Target active-context ratio used by the rollover scheduler |
-| `BILI_WORKFLOW_PHASE_GC` | `1` | Enable phase-boundary garbage collection |
-| `BILI_WORKFLOW_SESSION_GC` | `1` | Enable session/project history compaction policy |
-| `BILI_WORKFLOW_REREAD_AFTER_PHASE` | `1` | Require repository re-read semantics after a phase rollover |
-| `BILI_WORKFLOW_PRUNER` | `1` | Enable deterministic pre-ingest tool pruning |
-| `BILI_WORKFLOW_PRUNER_MIN_TOKENS` | `2000` | Minimum cleaned tool-output size for semantic structuring |
-| `BILI_WORKFLOW_CHEAP_MODEL_ENABLED` | `0` | Enable the optional OpenAI-compatible cheap-output pruner |
-| `BILI_WORKFLOW_CHEAP_MODEL_ENDPOINT` | *(none)* | Full chat-completions endpoint; local, free-tier, nano or custom APIs are supported |
-| `BILI_WORKFLOW_CHEAP_MODEL_NAME` | *(none)* | Cheap model name sent to the endpoint |
-| `BILI_WORKFLOW_CHEAP_MODEL_API_KEY` | *(none)* | Optional bearer token for the cheap-model endpoint |
-| `BILI_WORKFLOW_CHEAP_MODEL_MIN_TOKENS` | `8000` | Minimum remaining output size before the cheap model is considered |
-| `BILI_WORKFLOW_CHEAP_MODEL_MAX_OUTPUT_TOKENS` | `2000` | Maximum cheap-pruner response tokens |
-| `BILI_WORKFLOW_CHEAP_MODEL_TIMEOUT_MS` | `30000` | Cheap-pruner request timeout |
-| `BILI_WORKFLOW_ROLLOVER_MIN_TOKENS` | `12000` | Pending-drop size that triggers phase rollover |
-| `BILI_WORKFLOW_ARCHIVE_RAW` | `1` | Archive semantically pruned raw output |
-| `BILI_WORKFLOW_PROJECT_KEY` | *(auto)* | Explicit stable project identity when Codex metadata/cwd is unavailable |
-| `BILI_WORKFLOW_REPO_BRIDGE` | `1` | Track current workspace/repository identity and file freshness |
-| `BILI_WORKFLOW_REQUIRE_REREAD_AFTER_PHASE` | `1` | Require a fresh repository read before trusting code facts after a phase boundary |
-| `BILI_WORKFLOW_ENFORCE_REREAD` | *(legacy alias)* | Deprecated compatibility alias for `BILI_WORKFLOW_REQUIRE_REREAD_AFTER_PHASE` |
-| `BILI_WORKFLOW_WORKSPACE_ROOT` | *(auto)* | Explicit workspace root when Codex request metadata is unavailable |
-| `BILI_WORKFLOW_REPO_HASH_MAX_BYTES` | `4194304` | Maximum file size hashed by Repo Bridge |
-| `BILI_WORKFLOW_REPO_GIT_TIMEOUT_MS` | `2000` | Timeout for read-only repository probes |
-| `BILI_WORKFLOW_CACHE_PROTECT_HIT_RATIO` | `0.65` | Cache-hit ratio above which a small rollover is expensive to rewrite |
-| `BILI_WORKFLOW_CACHE_HIGH_GROWTH_RATE` | `0.18` | Context growth ratio treated as high pressure |
-| `BILI_WORKFLOW_CACHE_EXPECTED_TOKENS_PER_STEP` | `8000` | Expected token growth per remaining plan step |
-| `BILI_WORKFLOW_CACHE_MAX_EXPECTED_TOKENS` | `64000` | Cap on projected next-work growth |
-| `BILI_WORKFLOW_CACHE_DEBUG_WINDOW` | `10` | Recent operation window used to detect active debugging |
-| `BILI_WORKFLOW_CACHE_REWRITE_WEIGHT` | `1.1` | Weight applied to prompt-prefix rewrite cost |
-| `BILI_WORKFLOW_MEMORY_MAX_INJECTED_TOKENS` | `12000` | Total Project Memory injection budget |
-| `BILI_WORKFLOW_MEMORY_MAX_PROJECT_SESSIONS` | `6` | Recent session checkpoints retained for project injection |
-| `BILI_WORKFLOW_HISTORIAN_ENABLED` | `0` | Enable the optional structured-history model |
-| `BILI_WORKFLOW_HISTORIAN_ENDPOINT` | *(cheap endpoint)* | OpenAI-compatible Historian endpoint; inherits Cheap Pruner endpoint when omitted |
-| `BILI_WORKFLOW_HISTORIAN_MODEL` | *(cheap model)* | Historian model; inherits Cheap Pruner model when omitted |
-| `BILI_WORKFLOW_HISTORIAN_API_KEY` | *(cheap key)* | Optional Historian bearer token |
-| `BILI_WORKFLOW_HISTORIAN_MAX_INPUT_TOKENS` | `16000` | Maximum structured checkpoint input |
-| `BILI_WORKFLOW_HISTORIAN_MAX_OUTPUT_TOKENS` | `2000` | Maximum Historian narrative output |
-| `BILI_WORKFLOW_HISTORIAN_TIMEOUT_MS` | `30000` | Historian request timeout |
 
 ### Config file (optional)
 
@@ -463,33 +470,6 @@ The config file is a single JSON object. Example:
 {
   "port": 8787,
   "host": "127.0.0.1",
-  "workflow": {
-    "enabled": true,
-    "context": { "targetRatio": 0.2, "phaseGc": true, "sessionGc": true },
-    "code": { "rereadAfterPhase": true },
-    "pruner": {
-      "enabled": true,
-      "minTokens": 2000,
-      "cheapModel": {
-        "enabled": false,
-        "endpoint": "http://127.0.0.1:11434/v1/chat/completions",
-        "model": "qwen3:4b"
-      }
-    },
-    "archive": { "semanticRaw": true },
-    "repoBridge": { "enabled": true, "requireRereadAfterPhase": true },
-    "cache": {
-      "protectCacheHitRatio": 0.65,
-      "highGrowthRate": 0.18,
-      "expectedTokensPerStep": 8000
-    },
-    "memory": { "maxInjectedTokens": 12000, "maxProjectSessions": 6 },
-    "historian": {
-      "enabled": false,
-      "endpoint": "http://127.0.0.1:11434/v1/chat/completions",
-      "model": "qwen3:4b"
-    }
-  },
   "providers": {
     "https://open.bigmodel.cn/api/coding/paas/v4": {
       "models": {
@@ -625,9 +605,8 @@ doesn't know). Everything else is for advanced tuning.
 - Models not covered by any matching key fall back to models.dev, then the
   prefix table, then `modelContextLimit`.
 
-**Client upstream API keys are never stored in the proxy** — whatever key the
-agent sends is passed through untouched. Optional Cheap Pruner/Historian
-credentials are separate workflow settings and are write-only in the Web UI.
+**API keys are never stored in the proxy** — whatever key the agent sends is
+passed through untouched to the upstream.
 
 ### Upstream proxy (firewall / GFW)
 
@@ -730,7 +709,7 @@ pass an explicit `x-acp-session` header per conversation to avoid collisions.
 
 ## Status
 
-Active development. Anthropic, OpenAI Chat and Responses adapters, Codex official transport, deterministic tool pruning, Repo Bridge guards, cache-aware rollover, layered project memory, Cheap Historian and cross-source usage deduplication are covered by the automated test suite.
+Early. Protocol handling and compression work against mock tests (146 passing). Real-model integration testing is the next milestone. Expect rough edges.
 
 See [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) for the pi-extension mode (in-process, tighter integration, the reference implementation).
 

@@ -2,13 +2,14 @@ import { createHash } from "node:crypto";
 import { responsesToCore, type ResponsesRequestBody, type ResponseInputItem } from "../responses.js";
 import type { Session } from "../session.js";
 import { applyDeferredRollover, beginWorkflowTurn, checkpointRequest, workflowMemory } from "./context-gc.js";
-import { operationForCall, trackOperationCall, updateOperationResult } from "./operation-tracker.js";
+import { observeCodexNestedOperations, operationForCall, trackOperationCall, updateOperationResult } from "./operation-tracker.js";
 import { applyPlanUpdate } from "./plan-tracker.js";
 import { extractCodexUpdatePlanCalls } from "./codex-code-mode.js";
 import { pruneWithCheapModel } from "./pruner/cheap-model.js";
 import { commitSemanticPrune, pruneToolOutput } from "./pruner/index.js";
 import { hydrateProjectMemory, runCheapHistorian } from "./project-memory.js";
 import { syncRequirements } from "./requirements.js";
+import { ingestRequirementDocumentForOperation, registerPendingRequirementDocuments } from "./requirement-document.js";
 import { capturePhaseMessage } from "./state.js";
 import { observePhaseBoundaryFallback } from "./phase-boundary.js";
 import {
@@ -21,6 +22,7 @@ import {
 import type { WorkflowOptions } from "./types.js";
 import { isWorkflowItem, isWorkflowResultItem, isWorkflowResultText, isWorkflowText, stripWorkflowMarker } from "./workflow-item.js";
 import { classifyRequirementProvenance, isCodexHostContext } from "./provenance.js";
+import { executionSupervisorNudge } from "./execution-supervisor.js";
 
 export type WorkflowPreprocessResult = {
     body: ResponsesRequestBody;
@@ -113,8 +115,13 @@ function parseCodexTurnMetadata(body: ResponsesRequestBody): WorkspaceHints {
           : metadata.git && typeof metadata.git === "object" && !Array.isArray(metadata.git)
             ? metadata.git as Record<string, unknown>
           : { ...metadata, ...workspaceDetails };
-    const remoteIdentity = ["remote", "remote_url", "remoteUrl", "origin"].map((key) => repository[key]).find((item): item is string => typeof item === "string" && Boolean(item.trim()));
-    const head = ["commit", "head", "current_commit", "currentCommit"].map((key) => repository[key]).find((item): item is string => typeof item === "string" && Boolean(item.trim()));
+    const associatedRemoteUrls = repository.associated_remote_urls;
+    const associatedOrigin = associatedRemoteUrls && typeof associatedRemoteUrls === "object" && !Array.isArray(associatedRemoteUrls)
+        ? (associatedRemoteUrls as Record<string, unknown>).origin
+        : undefined;
+    const remoteIdentity = ["remote", "remote_url", "remoteUrl", "origin"].map((key) => repository[key]).find((item): item is string => typeof item === "string" && Boolean(item.trim()))
+        ?? (typeof associatedOrigin === "string" && associatedOrigin.trim() ? associatedOrigin : undefined);
+    const head = ["commit", "head", "current_commit", "currentCommit", "latest_git_commit_hash"].map((key) => repository[key]).find((item): item is string => typeof item === "string" && Boolean(item.trim()));
     const dirty = ["has_changes", "hasChanges", "dirty"].map((key) => repository[key]).find((item): item is boolean => typeof item === "boolean");
     return {
         ...(workspaceRoot ? { workspaceRoot: workspaceRoot.trim() } : {}),
@@ -196,9 +203,8 @@ function messageIdentity(item: ResponseInputItem): string | undefined {
                 return typeof value === "string" ? value : "";
             }).join("\n")
           : "";
-    const tagReference = /^\s*\x3cacp\b[^>]*\x3e([^<]+)\x3c\/acp\x3e\s*/i.exec(text)?.[1]?.trim();
     const normalized = text.replace(/^\s*\x3cacp\b[^>]*\x3e[^<]+\x3c\/acp\x3e\s*/i, "");
-    return `${String(record.role ?? "unknown")}:${tagReference ?? createHash("sha256").update(normalized).digest("hex").slice(0, 20)}`;
+    return `${String(record.role ?? "unknown")}:${createHash("sha256").update(normalized).digest("hex").slice(0, 20)}`;
 }
 
 function responseItemKeys(items: ResponseInputItem[]): string[] {
@@ -330,6 +336,7 @@ export async function preprocessResponsesWorkflow(
     if (options.sessionGc) hydrateProjectMemory(session.id, state, options.memory.maxProjectSessions);
     const workflowProjection = responsesToCore(cleanBody);
     syncRequirements(state, workflowProjection.msgs, session.id);
+    registerPendingRequirementDocuments(state, workflowProjection.msgs, session.id, workspace);
     observePhaseBoundaryFallback(state, workflowProjection.msgs);
     if (options.sessionGc) await runCheapHistorian(session.id, state, options);
     applyDeferredRollover(state, options, session.stats.lastInputTokens || session.stats.contextTokens, modelContextLimit, body.model);
@@ -363,6 +370,7 @@ export async function preprocessResponsesWorkflow(
                   : [];
             for (const planCall of planCalls) applyPlanUpdate(state, planCall.callId, planCall.argumentsText);
             observeRepositoryOperation(state, operation, options.repoBridge);
+            observeCodexNestedOperations(state, operation, options.repoBridge);
             continue;
         }
         const output = outputFields(item);
@@ -420,6 +428,9 @@ export async function preprocessResponsesWorkflow(
             transformed.push(item);
             continue;
         }
+        if (operation.type === "READ") {
+            ingestRequirementDocumentForOperation(state, operation, output.output, session.id, workspace);
+        }
         let result = pruneToolOutput(operation, output.output, options);
         result = await pruneWithCheapModel(operation, result, options, { phaseObjective, requirementHint });
         result = commitSemanticPrune(session.id, state, operation, output.output, result, options.archiveSemanticRaw);
@@ -448,6 +459,8 @@ export async function preprocessResponsesWorkflow(
     if (request) filtered.push(workflowItem(request));
     const guard = repositoryGuardMessage(state);
     if (guard) filtered.push(workflowItem(guard));
+    const supervisor = executionSupervisorNudge(state);
+    if (supervisor) filtered.push(workflowItem(supervisor));
     return {
         body: { ...cleanBody, input: filtered.map(stripWorkflowMarker) },
         prunedOperations,

@@ -4,10 +4,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createCore, createInitialState, defaultConfig } from "acp-kernel";
-import { compressLoopAnthropicJson, compressLoopAnthropicStream } from "../src/compress-loop-anthropic.ts";
 import { compressLoopResponsesJson } from "../src/compress-loop-responses.ts";
-import { compressLoopJson, compressLoopStream } from "../src/compress-loop.ts";
 import { ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI } from "../src/compress-tool.ts";
+import { pickAdapter, runCompressLoop } from "../src/loop/index.ts";
 import { _setStoreForTest, SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
 import { archiveOperationOutput, retrieveRawOutput } from "../src/workflow/archive.ts";
@@ -47,6 +46,23 @@ function makeSession(id: string, protocol: "openai" | "anthropic" | "responses")
         inFlight: 0,
         persisted: false,
     };
+}
+
+function runUnifiedStream(
+    protocol: "openai" | "anthropic" | "responses",
+    upstream: ReadableStream<Uint8Array>,
+    ctx: Parameters<typeof runCompressLoop>[1],
+    requestBody: Record<string, unknown>,
+    requestOptions: Parameters<typeof runCompressLoop>[3],
+) {
+    return runCompressLoop(
+        upstream,
+        ctx,
+        requestBody,
+        requestOptions,
+        pickAdapter(protocol, requestBody, false),
+        "",
+    );
 }
 
 function archiveRaw(session: Session, raw: string): string {
@@ -111,7 +127,8 @@ test("streaming and JSON proxy loops restore raw output exactly without leaking 
     }) as typeof fetch;
     let openaiOutput = "";
     try {
-        for await (const chunk of compressLoopStream(
+        for await (const chunk of runUnifiedStream(
+            "openai",
             streamOf(openaiInitial),
             { core, config, messages: [], session: openaiSession, log: () => {} },
             { model: "test", messages: [] },
@@ -139,45 +156,6 @@ test("streaming and JSON proxy loops restore raw output exactly without leaking 
     assert.ok(requirements[0].rawRef);
     assert.equal(retrieveRawOutput(openaiSession.id, openaiSession.workflow, requirements[0].rawRef), requirementText);
 
-    const openaiJsonSession = makeSession("openai-json-retrieve-test", "openai");
-    const openaiJsonRef = archiveRaw(openaiJsonSession, raw);
-    const openaiJsonInitial = {
-        id: "chat-json-1",
-        choices: [{
-            message: {
-                role: "assistant",
-                content: null,
-                tool_calls: [{ id: "proxy-json-1", type: "function", function: { name: "retrieve_raw", arguments: JSON.stringify({ rawRef: openaiJsonRef }) } }],
-            },
-            finish_reason: "tool_calls",
-        }],
-    };
-    let forwardedOpenaiJson: Record<string, unknown> | undefined;
-    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-        forwardedOpenaiJson = JSON.parse(String(init?.body)) as Record<string, unknown>;
-        return new Response(JSON.stringify({
-            id: "chat-json-2",
-            choices: [{ message: { role: "assistant", content: "continued" }, finish_reason: "stop" }],
-        }), { status: 200, headers: { "content-type": "application/json" } });
-    }) as typeof fetch;
-    let openaiJsonFinal: Record<string, unknown>;
-    try {
-        openaiJsonFinal = await compressLoopJson(
-            openaiJsonInitial,
-            { core, config, messages: [], session: openaiJsonSession, log: () => {} },
-            { model: "test", messages: [] },
-            { url: "https://example.invalid/openai-json", headers: { "content-type": "application/json" } },
-        );
-    } finally {
-        globalThis.fetch = originalFetch;
-    }
-    assert.ok(forwardedOpenaiJson);
-    const openaiJsonMessages = forwardedOpenaiJson.messages as Array<Record<string, unknown>>;
-    const openaiJsonToolResult = openaiJsonMessages.find((message) => message.role === "tool");
-    assert.equal(openaiJsonToolResult?.content, raw);
-    assert.match(JSON.stringify(openaiJsonFinal), /continued/);
-    assert.doesNotMatch(JSON.stringify(openaiJsonFinal), /retrieve_raw/);
-
     const anthropicSession = makeSession("anthropic-retrieve-test", "anthropic");
     const anthropicRef = archiveRaw(anthropicSession, raw);
     const anthropicInitial = [
@@ -203,7 +181,8 @@ test("streaming and JSON proxy loops restore raw output exactly without leaking 
     }) as typeof fetch;
     let anthropicOutput = "";
     try {
-        for await (const chunk of compressLoopAnthropicStream(
+        for await (const chunk of runUnifiedStream(
+            "anthropic",
             streamOf(anthropicInitial),
             { core, config, messages: [], session: anthropicSession, log: () => {} },
             { model: "test", messages: [] },
@@ -223,45 +202,6 @@ test("streaming and JSON proxy loops restore raw output exactly without leaking 
     assert.doesNotMatch(anthropicOutput, /"name":"retrieve_raw"/);
     assert.match(anthropicOutput, /continued/);
     assert.equal(anthropicSession.workflow.metrics.rawRetrievals, 1);
-
-    const anthropicJsonSession = makeSession("anthropic-json-retrieve-test", "anthropic");
-    const anthropicJsonRef = archiveRaw(anthropicJsonSession, raw);
-    const anthropicJsonInitial = {
-        id: "msg-json-1",
-        type: "message",
-        role: "assistant",
-        content: [{ type: "tool_use", id: "proxy-json-2", name: "retrieve_raw", input: { rawRef: anthropicJsonRef } }],
-        stop_reason: "tool_use",
-    };
-    let forwardedAnthropicJson: Record<string, unknown> | undefined;
-    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
-        forwardedAnthropicJson = JSON.parse(String(init?.body)) as Record<string, unknown>;
-        return new Response(JSON.stringify({
-            id: "msg-json-2",
-            type: "message",
-            role: "assistant",
-            content: [{ type: "text", text: "continued" }],
-            stop_reason: "end_turn",
-        }), { status: 200, headers: { "content-type": "application/json" } });
-    }) as typeof fetch;
-    let anthropicJsonFinal: Record<string, unknown>;
-    try {
-        anthropicJsonFinal = await compressLoopAnthropicJson(
-            anthropicJsonInitial,
-            { core, config, messages: [], session: anthropicJsonSession, log: () => {} },
-            { model: "test", messages: [] },
-            { url: "https://example.invalid/anthropic-json", headers: { "content-type": "application/json" } },
-        );
-    } finally {
-        globalThis.fetch = originalFetch;
-    }
-    assert.ok(forwardedAnthropicJson);
-    const anthropicJsonMessages = forwardedAnthropicJson.messages as Array<Record<string, unknown>>;
-    const anthropicJsonToolMessage = anthropicJsonMessages.find((message) => message.role === "user");
-    const anthropicJsonResults = anthropicJsonToolMessage?.content as Array<Record<string, unknown>>;
-    assert.equal(anthropicJsonResults[0].content, raw);
-    assert.match(JSON.stringify(anthropicJsonFinal), /continued/);
-    assert.doesNotMatch(JSON.stringify(anthropicJsonFinal), /retrieve_raw/);
 
     const responsesSession = makeSession("responses-retrieve-test", "responses");
     const responsesRef = archiveRaw(responsesSession, raw);

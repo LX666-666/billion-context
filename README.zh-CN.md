@@ -19,9 +19,9 @@ AI 编程助手的通用上下文压缩代理。
         │  你把助手的 base URL 指向 proxy
         ▼
 ┌─────────────────┐
-│  billion-context│   1. 解析 Anthropic / Chat / Responses 请求
-│     proxy       │   2. Tool Output 首次入模前裁剪
-│                 │   3. Workflow GC + acp-kernel 压缩
+│  billion-context│   1. 解析请求(Anthropic 或 OpenAI 格式)
+│     proxy       │   2. 对对话运行 acp-kernel 压缩
+│                 │   3. 注入 `compress` 工具 + 压缩哲学
 │                 │   4. 转发到真实模型 API
 │                 │   5. 重写流式响应
 └─────────────────┘
@@ -30,19 +30,7 @@ AI 编程助手的通用上下文压缩代理。
    真实模型 API (Anthropic / OpenAI / 兼容厂商)
 ```
 
-代理向对话注入六个上下文工具(`compress`、`decompress`、`search_context`、`acp_status`、`retrieve_raw`、`expand_operation`)。Responses 客户端还会获得 `workflow_checkpoint`;Codex code mode 使用等价的、由代理截获的文本协议,不会破坏原生工具。
-
-### 工作流感知的上下文管理
-
-- BUILD、TEST、RUN、INSTALL、SEARCH、LIST、JSON、JSONL 输出会在昂贵主模型第一次读取前清噪并结构化;精确错误、断言、位置、崩溃信号和脱敏环境线索会保留,有语义的原始输出用 `raw_ref` 归档且可恢复。
-- READ、PATCH、WRITE、DIFF 默认禁止语义裁剪,不会让便宜模型总结当前源码。
-- 可选的 OpenAI-compatible 便宜模型只处理确定性阶段后仍然很大的低价值输出。它只接收当前输出、Phase 目标和有界 Requirement Hint,不会收到完整 Session;若精确诊断行丢失则原样回退。
-- Codex `update_plan` 是 Phase 边界。Phase 完成后先由主模型写 checkpoint,再一次性 rollover 旧 READ/PATCH/日志工作集。
-- Repo Bridge 记录 workspace/repository root、remote identity、HEAD、dirty state 和文件签名。Phase 边界、HEAD 变化或外部文件变化会把旧 READ 标记为 stale;Codex 重读所有受影响的当前文件前,mutation 会被阻止。
-- Rollover scheduler 同时考虑 cache hit ratio、context/tool growth、pending garbage、debugging 状态、prefix rewrite cost 和 expected next work;极小 Phase 可延迟 GC,但不会丢掉 pending-drop 标记。
-- Project Memory 自动区分继续旧任务与开始新任务,在严格注入预算内做 Phase → Session → Project 分层 checkpoint。可选 Cheap Historian 只能从结构化事实生成有界叙事,不能覆盖精确需求、决策、错误或 Repository 状态。
-
-Codex Responses 是第一优先级工作流适配器;Anthropic 和 OpenAI Chat 复用同一套确定性 pre-ingest pruning 核心。
+代理向对话注入四个上下文管理工具(`compress`、`decompress`、`search_context`、`acp_status`)。模型在对话增长时调用 `compress`,代理在服务端执行 —— 压缩后的范围在下一轮之前折叠进对话历史。
 
 ## 安装
 
@@ -59,7 +47,7 @@ npm install -g billion-context
 - **零配置(最简单):** 在客户端 baseURL 前面加上代理地址 + `/bili/`。无需配置文件 —— context 窗口自动从 [models.dev](https://models.dev) registry 查询。`/bili/` 前缀还是个自检测信号:billion-context 的客户端扩展(billion-context-pi / opencode-acp)能在自己的 baseUrl 里认出它并自禁用,避免双层压缩。
 - **显式 context 窗口覆盖:** 在配置文件(或网页)里按 URL 声明 context 窗口,用于 registry 不认识的端点,或想钉死一个精确值的场景。两种方式路由都是同一个 `/bili/` 前缀 —— 配置只改变代理用哪个 context 窗口。
 
-核心压缩会自动注入;不配置 Workflow 也能完成路由。可选 Workflow、输出裁剪模型和 Historian 可以通过配置文件、环境变量或网页调整。
+压缩是自动注入的 —— 你只需配置路由,无需配置压缩本身。
 
 ### 方式 A —— 零配置(`/bili/` 前缀)
 
@@ -189,7 +177,7 @@ URL 声明按模型的 context 窗口:
 
 ### 方式C 网页配置&设置上下文大小
 
-打开 [http://localhost:8787/__bili/](http://localhost:8787/__bili/) 进行配置。**上下文**页可设置 Workflow/Phase GC、可选输出压缩模型、Cheap Historian、Repo Bridge、cache-aware scheduler,并查看逐 Session telemetry。保存后运行中的代理会热更新。模型 API Key 是只写字段:网页可以替换或清除,读取配置时永远不会返回原值。
+打开 [http://localhost:8787/__bili/](http://localhost:8787/__bili/) 进行配置。
 
 ### 验证
 
@@ -285,43 +273,6 @@ bili --no-auto-update        # 本次启动禁用自动更新
 | `BILI_PERSIST_DEBOUNCE_MS` | `500` | 写磁盘的防抖窗口(毫秒) |
 | `BILI_MAX_SESSIONS` | `256` | 内存中保留的最大会话数(LRU 淘汰;磁盘是真相源) |
 | `BILI_SESSIONS_DIR` | *(XDG data 目录)* | 持久化会话状态的目录 |
-| `BILI_WORKFLOW_ENABLED` | `1` | 启用工作流感知上下文管理 |
-| `BILI_WORKFLOW_TARGET_RATIO` | `0.20` | rollover 调度器的目标活跃上下文比例 |
-| `BILI_WORKFLOW_PHASE_GC` | `1` | 启用 Phase 边界 GC |
-| `BILI_WORKFLOW_SESSION_GC` | `1` | 启用 Session / Project History 压缩策略 |
-| `BILI_WORKFLOW_REREAD_AFTER_PHASE` | `1` | Phase rollover 后要求重新读取 Repository |
-| `BILI_WORKFLOW_PRUNER` | `1` | 启用确定性首次入模前裁剪 |
-| `BILI_WORKFLOW_PRUNER_MIN_TOKENS` | `2000` | 触发语义结构化的最小清理后 Tool Output 大小 |
-| `BILI_WORKFLOW_CHEAP_MODEL_ENABLED` | `0` | 启用可选的 OpenAI-compatible 便宜输出裁剪器 |
-| `BILI_WORKFLOW_CHEAP_MODEL_ENDPOINT` | *(无)* | 完整 chat-completions 端点;支持本地、免费层、nano 或自定义 API |
-| `BILI_WORKFLOW_CHEAP_MODEL_NAME` | *(无)* | 发送给端点的便宜模型名 |
-| `BILI_WORKFLOW_CHEAP_MODEL_API_KEY` | *(无)* | 便宜模型端点的可选 Bearer Token |
-| `BILI_WORKFLOW_CHEAP_MODEL_MIN_TOKENS` | `8000` | 确定性处理后仍达到此大小才考虑便宜模型 |
-| `BILI_WORKFLOW_CHEAP_MODEL_MAX_OUTPUT_TOKENS` | `2000` | 便宜模型裁剪结果的最大 Token |
-| `BILI_WORKFLOW_CHEAP_MODEL_TIMEOUT_MS` | `30000` | 便宜模型请求超时 |
-| `BILI_WORKFLOW_ROLLOVER_MIN_TOKENS` | `12000` | 触发 Phase rollover 的 pending-drop 大小 |
-| `BILI_WORKFLOW_ARCHIVE_RAW` | `1` | 归档被语义裁剪的原始输出 |
-| `BILI_WORKFLOW_PROJECT_KEY` | *(自动)* | Codex metadata/cwd 不可用时显式指定稳定项目标识 |
-| `BILI_WORKFLOW_REPO_BRIDGE` | `1` | 跟踪当前 workspace/repository identity 与文件新鲜度 |
-| `BILI_WORKFLOW_ENFORCE_REREAD` | `1` | 阻止依赖旧 Phase/HEAD/文件 READ 的 mutation |
-| `BILI_WORKFLOW_WORKSPACE_ROOT` | *(自动)* | Codex request metadata 不可用时显式指定 workspace root |
-| `BILI_WORKFLOW_REPO_HASH_MAX_BYTES` | `4194304` | Repo Bridge 计算文件签名的最大文件大小 |
-| `BILI_WORKFLOW_REPO_GIT_TIMEOUT_MS` | `2000` | 只读 Repository 探测超时 |
-| `BILI_WORKFLOW_CACHE_PROTECT_HIT_RATIO` | `0.65` | 高于此 cache hit ratio 时,小型 rollover 的重写代价较高 |
-| `BILI_WORKFLOW_CACHE_HIGH_GROWTH_RATE` | `0.18` | 视为高压力的 context 增长率 |
-| `BILI_WORKFLOW_CACHE_EXPECTED_TOKENS_PER_STEP` | `8000` | 每个剩余 Plan step 的预计 token 增长 |
-| `BILI_WORKFLOW_CACHE_MAX_EXPECTED_TOKENS` | `64000` | expected next work 投影上限 |
-| `BILI_WORKFLOW_CACHE_DEBUG_WINDOW` | `10` | 检测 active debugging 的最近 operation 窗口 |
-| `BILI_WORKFLOW_CACHE_REWRITE_WEIGHT` | `1.1` | prompt prefix rewrite cost 权重 |
-| `BILI_WORKFLOW_MEMORY_MAX_INJECTED_TOKENS` | `12000` | Project Memory 总注入预算 |
-| `BILI_WORKFLOW_MEMORY_MAX_PROJECT_SESSIONS` | `6` | Project 注入保留的最近 Session checkpoint 数 |
-| `BILI_WORKFLOW_HISTORIAN_ENABLED` | `0` | 启用可选的结构化历史模型 |
-| `BILI_WORKFLOW_HISTORIAN_ENDPOINT` | *(继承 Cheap endpoint)* | OpenAI-compatible Historian endpoint |
-| `BILI_WORKFLOW_HISTORIAN_MODEL` | *(继承 Cheap model)* | Historian 模型 |
-| `BILI_WORKFLOW_HISTORIAN_API_KEY` | *(继承 Cheap key)* | 可选 Historian Bearer Token |
-| `BILI_WORKFLOW_HISTORIAN_MAX_INPUT_TOKENS` | `16000` | 最大结构化 checkpoint 输入 |
-| `BILI_WORKFLOW_HISTORIAN_MAX_OUTPUT_TOKENS` | `2000` | 最大 Historian 叙事输出 |
-| `BILI_WORKFLOW_HISTORIAN_TIMEOUT_MS` | `30000` | Historian 请求超时 |
 
 ### 配置文件(可选)
 
@@ -336,33 +287,6 @@ bili --no-auto-update        # 本次启动禁用自动更新
 {
   "port": 8787,
   "host": "127.0.0.1",
-  "workflow": {
-    "enabled": true,
-    "context": { "targetRatio": 0.2, "phaseGc": true, "sessionGc": true },
-    "code": { "rereadAfterPhase": true },
-    "pruner": {
-      "enabled": true,
-      "minTokens": 2000,
-      "cheapModel": {
-        "enabled": false,
-        "endpoint": "http://127.0.0.1:11434/v1/chat/completions",
-        "model": "qwen3:4b"
-      }
-    },
-    "archive": { "semanticRaw": true },
-    "repoBridge": { "enabled": true, "enforceReread": true },
-    "cache": {
-      "protectCacheHitRatio": 0.65,
-      "highGrowthRate": 0.18,
-      "expectedTokensPerStep": 8000
-    },
-    "memory": { "maxInjectedTokens": 12000, "maxProjectSessions": 6 },
-    "historian": {
-      "enabled": false,
-      "endpoint": "http://127.0.0.1:11434/v1/chat/completions",
-      "model": "qwen3:4b"
-    }
-  },
   "providers": {
     "https://open.bigmodel.cn/api/coding/paas/v4": {
       "models": {
@@ -478,7 +402,7 @@ key 就是客户端写在 `/bili/` 后面的那个字符串:
 - key 永不跨 host(边界检查要求 key 后面是 `/` 或字符串结尾),所以 `https://x.com` 不会匹配 `https://x.com.evil`。
 - 未被任何匹配 key 覆盖的模型回退到 models.dev,再回退到前缀表,最后回退到 `modelContextLimit`。
 
-**客户端上游 API key 永远不存进代理** —— 助手发什么 key,原样透传给上游。可选 Cheap Pruner/Historian 凭证属于独立 Workflow 设置,在网页中始终只写不可读。
+**API key 永远不存进代理** —— 助手发什么 key,原样透传给上游。
 
 ### 上游代理(防火墙 / GFW)
 
@@ -554,7 +478,7 @@ Windows 下会自动发现常见 Clash/Mihomo 静态系统代理;Web UI 会显�
 
 ## 状态
 
-持续开发中。Anthropic、OpenAI Chat、Responses 适配器、Codex 官方传输、确定性 Tool Pruning、Repo Bridge guard、cache-aware rollover、分层 Project Memory、Cheap Historian 和跨来源 Usage 去重均有自动化测试覆盖。
+早期。协议处理和压缩已通过 mock 测试(146 项通过)。真实模型集成测试是下一里程碑。预期会有粗糙的地方。
 
 pi 扩展模式(进程内、更紧密集成、参考实现)见 [billion-context-pi](https://github.com/ranxianglei/billion-context-pi)。
 

@@ -22,6 +22,7 @@ import { fetchWithTimeout } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
 import { log as loggerLog } from "../logger.js";
 import { expandOperation, retrieveRawOutput } from "../workflow/archive.js";
+import { arbitrateAcpRanges } from "../workflow/acp-arbitration.js";
 import { recordWorkflowCheckpoint } from "../workflow/context-gc.js";
 import { markWorkflowOperations } from "../workflow/operation-tracker.js";
 import { saveProjectMemory } from "../workflow/project-memory.js";
@@ -101,7 +102,14 @@ export function executeProxyTool(
     callId?: string,
 ): string {
     if (toolName === "compress") {
-        return applyRanges(parseCompressInput(args, callId), ctx);
+        const parsedRanges = parseCompressInput(args, callId);
+        const workflow = ctx.session.workflow;
+        if (!workflow) return applyRanges(parsedRanges, ctx);
+        const arbitration = arbitrateAcpRanges(workflow, parsedRanges, ctx.messages);
+        if (arbitration.rejected.length > 0) {
+            ctx.log(`[acp-arbitration] rejected ${arbitration.rejected.length}/${parsedRanges.length} range(s): ${arbitration.reason}`);
+        }
+        return applyRanges(arbitration.ranges, ctx);
     }
     if (toolName === "decompress") {
         return resolveDecompress(args, ctx);

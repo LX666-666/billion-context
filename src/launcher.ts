@@ -321,9 +321,16 @@ export function preparePiHttpRewrite(
     try {
         for (const entry of fs.readdirSync(piHome)) {
             if (entry === "models.json") continue;
+            const source = path.join(piHome, entry);
+            const target = path.join(tmp, entry);
             try {
-                fs.symlinkSync(path.join(piHome, entry), path.join(tmp, entry));
-            } catch {}
+                const type = fs.statSync(source).isDirectory()
+                    ? (process.platform === "win32" ? "junction" : "dir")
+                    : "file";
+                fs.symlinkSync(source, target, type);
+            } catch {
+                try { fs.cpSync(source, target, { recursive: true }); } catch {}
+            }
         }
     } catch {}
     fs.writeFileSync(path.join(tmp, "models.json"), JSON.stringify(root));

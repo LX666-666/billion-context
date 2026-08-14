@@ -1,5 +1,5 @@
-import type { OperationType } from "./types.js";
-import { containsCodexUpdatePlan } from "./codex-code-mode.js";
+import type { CodexNestedOperation, OperationType } from "./types.js";
+import { containsCodexUpdatePlan, extractCodexNestedCalls, type CodexNestedCall } from "./codex-code-mode.js";
 
 export type OperationClassification = {
     type: OperationType;
@@ -8,6 +8,7 @@ export type OperationClassification = {
     workdir?: string;
     paths: string[];
     addedPaths: string[];
+    codexNested?: CodexNestedOperation[];
 };
 
 function parseArguments(argumentsText: string): Record<string, unknown> {
@@ -128,10 +129,52 @@ function classifyCommand(command: string): OperationType {
     return "RUN";
 }
 
+const NESTED_ENGINEERING_PRIORITY: OperationType[] = [
+    "PATCH", "WRITE", "DIFF", "READ", "SEARCH", "LIST", "TEST", "BUILD", "INSTALL", "RUN", "OTHER",
+];
+
+function classifyNestedCall(call: CodexNestedCall): CodexNestedOperation | undefined {
+    if (call.name === "update_plan") return undefined;
+    const nested = classifyOperation(call.name, call.argumentsText);
+    return {
+        type: nested.type,
+        ...(nested.command ? { command: nested.command } : {}),
+        ...(nested.workdir ? { workdir: nested.workdir } : {}),
+        paths: nested.paths,
+        addedPaths: nested.addedPaths,
+    };
+}
+
+function classifyCodexMixedExec(argumentsText: string): OperationClassification | undefined {
+    const nested = extractCodexNestedCalls("classify", argumentsText);
+    if (nested.length === 0) return undefined;
+    const engineering = nested.map(classifyNestedCall).filter((value): value is CodexNestedOperation => value !== undefined);
+    if (engineering.length === 0) return undefined;
+    let dominant = engineering[0]?.type ?? "OTHER";
+    for (const candidate of NESTED_ENGINEERING_PRIORITY) {
+        if (engineering.some((value) => value.type === candidate)) {
+            dominant = candidate;
+            break;
+        }
+    }
+    const paths = unique(engineering.flatMap((value) => value.paths));
+    const addedPaths = unique(engineering.flatMap((value) => value.addedPaths));
+    const command = engineering.map((value) => value.command).find((value): value is string => Boolean(value));
+    const workdir = engineering.map((value) => value.workdir).find((value): value is string => Boolean(value));
+    return {
+        ...classification(dominant, command, undefined, workdir, argumentsText, paths, addedPaths),
+        codexNested: engineering,
+    };
+}
+
 export function classifyOperation(toolName: string, argumentsText: string): OperationClassification {
     const lower = toolName.toLowerCase();
-    if ((lower === "exec" || lower === "codex") && containsCodexUpdatePlan(argumentsText)) {
-        return classification("PLAN", undefined, undefined, undefined, argumentsText);
+    if (lower === "exec" || lower === "codex") {
+        const mixed = classifyCodexMixedExec(argumentsText);
+        if (mixed) return mixed;
+        if (containsCodexUpdatePlan(argumentsText)) {
+            return classification("PLAN", undefined, undefined, undefined, argumentsText);
+        }
     }
     const args = parseArguments(argumentsText);
     const embeddedCommand = embeddedStringField(argumentsText, "command", "cmd", "script");

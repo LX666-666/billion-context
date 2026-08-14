@@ -6,7 +6,7 @@ import { estimateTokensFast } from "acp-kernel";
 import { isWorkflowMessage } from "./workflow-item.js";
 import { classifyRequirementProvenance, isRealUserRequirement } from "./provenance.js";
 
-function importance(detail: string): RequirementRecord["importance"] {
+export function requirementImportance(detail: string): RequirementRecord["importance"] {
     return /(?:\b(?:must|never|critical|forbid|required|do not)\b|禁止|必须|绝不|不能|不得|优先级)/i.test(detail)
         ? "CRITICAL"
         : "NORMAL";
@@ -16,7 +16,7 @@ function cleanRequirementText(value: string): string {
     return value.replace(/^\s*\x3cacp\b[^>]*\x3e[^<]+\x3c\/acp\x3e\s*/i, "").trim();
 }
 
-function atomicDetails(detail: string): string[] {
+export function atomicRequirementDetails(detail: string): string[] {
     const lines = detail.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     const marked = lines.some((line) => /^\s*(?:[-*•]|\d+[.)]|[A-Z][.)])\s+/.test(line));
     if (!marked) return [detail.trim()];
@@ -53,7 +53,7 @@ export function syncRequirements(state: WorkflowState, messages: BiliMessage[], 
         if (!isRealUserRequirement(provenance)) continue;
         if (state.requirementBySourceRef[message.id]) continue;
         const messageId = `REQMSG-${String(state.nextRequirementMessageNumber++).padStart(5, "0")}`;
-        const details = atomicDetails(detailText);
+        const details = atomicRequirementDetails(detailText);
         const requirementIds: string[] = [];
         const messageRecord: RequirementMessageRecord = {
             messageId,
@@ -74,7 +74,7 @@ export function syncRequirements(state: WorkflowState, messages: BiliMessage[], 
                 parentMessageId: messageId,
                 detail,
                 status: details.length > 1 ? "ACTIVE_CURRENT" : "ACTIVE",
-                importance: importance(detail),
+                importance: requirementImportance(detail),
                 provenance,
                 preserveRaw: true,
                 createdAt: Date.now(),
@@ -109,16 +109,19 @@ export function refreshRequirementHistory(state: WorkflowState): number {
             || !state.archiveSessionId
             || !verifyRawArchiveCommit(state.archiveSessionId, state, message.rawRef)
             || !requirements.every((requirement) => terminal(requirement.status))) continue;
+        let transitioned = false;
         for (const requirement of requirements) {
             requirement.historicalDetail = requirement.detail;
             if (requirement.status !== "HISTORICAL") {
                 requirement.resolvedStatus = requirement.status;
                 requirement.status = "HISTORICAL";
+                transitioned = true;
             }
         }
         message.lifecycle = "PENDING_DROP";
         message.historicalAt = Date.now();
         changed++;
+        if (transitioned) state.requirementLedgerVersion++;
     }
     return changed;
 }

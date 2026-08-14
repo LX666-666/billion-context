@@ -346,6 +346,7 @@ export function observeRepositoryOperation(
 
 export function markPhaseRepositoryStateStale(state: WorkflowState, phaseId: string): void {
     for (const file of Object.values(state.repoBridge.files)) {
+        if (file.requirementDocument) continue;
         if (file.lastReadPhaseId !== phaseId && file.lastMutationPhaseId !== phaseId) continue;
         file.stale = true;
         file.staleReason = "PHASE_BOUNDARY";

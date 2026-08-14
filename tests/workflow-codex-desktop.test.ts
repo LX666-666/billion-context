@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -53,16 +54,16 @@ function bodyItems(plan: Fixture["plans"][number], index: number): ResponseInput
 }
 
 function desktopBody(items: ResponseInputItem[], workspaceRoot: string): ResponsesRequestBody {
+    const metadata = JSON.parse(fixture.client_metadata["x-codex-turn-metadata"] ?? "{}") as { workspaces?: unknown[] };
+    const firstWorkspace = metadata.workspaces?.[0];
+    metadata.workspaces = [
+        firstWorkspace && typeof firstWorkspace === "object" && !Array.isArray(firstWorkspace)
+            ? { ...(firstWorkspace as Record<string, unknown>), root: workspaceRoot }
+            : workspaceRoot,
+    ];
     return {
         model: "gpt-5-codex",
-        client_metadata: {
-            "x-codex-turn-metadata": JSON.stringify({
-                workspaces: [workspaceRoot],
-                remote: "https://example.invalid/acme/sample.git",
-                commit: "deadbeef",
-                has_changes: true,
-            }),
-        },
+        client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) },
         input: items,
     };
 }
@@ -136,9 +137,50 @@ test("realistic Codex Desktop wire fixture tracks every plan phase and ignores h
     assert.equal(Object.values(current.workflow.requirements)[0]?.detail, fixture.goal);
     assert.ok(current.workflow.repoBridge.workspaceRoot);
     assert.ok(current.workflow.repoBridge.repoRoot);
-    assert.ok(current.workflow.repoBridge.head);
-    assert.ok(current.workflow.repoBridge.remoteIdentity);
+    assert.equal(current.workflow.repoBridge.head, "deadbeef");
+    assert.equal(current.workflow.repoBridge.remoteIdentity, "https://example.invalid/acme/sample");
     assert.match(current.workflow.projectId ?? "", /^project-/);
+});
+
+test("Codex Desktop metadata yields to local Git repository identity", async (t) => {
+    const workspaceRoot = mkdtempSync(path.join(tmpdir(), "bili-codex-git-workspace-"));
+    t.after(() => rmSync(workspaceRoot, { recursive: true, force: true }));
+    const git = (args: string[]) => execFileSync("git", ["-C", workspaceRoot, ...args], { encoding: "utf8", windowsHide: true }).trim();
+    git(["init"]);
+    git(["config", "user.email", "codex-desktop@example.invalid"]);
+    git(["config", "user.name", "Codex Desktop Test"]);
+    const marker = path.join(workspaceRoot, "marker.txt");
+    writeFileSync(marker, "fixture\n", "utf8");
+    git(["add", "marker.txt"]);
+    git(["commit", "-m", "fixture"]);
+    git(["remote", "add", "origin", "https://local.invalid/acme/local.git"]);
+
+    const current = session("codex-desktop-git-priority");
+    const options = { ...DEFAULT_WORKFLOW_OPTIONS, sessionGc: false, rolloverMinTokens: 1_000_000 };
+    await preprocessResponsesWorkflow(desktopBody([], workspaceRoot), current, options, 400_000, true);
+
+    assert.equal(current.workflow.repoBridge.head, git(["rev-parse", "HEAD"]));
+    assert.equal(current.workflow.repoBridge.remoteIdentity, "https://local.invalid/acme/local");
+});
+
+test("Codex Desktop metadata fallback drives remoteIdentity, head and project identity when local Git is unavailable", async (t) => {
+    const dataHome = mkdtempSync(path.join(tmpdir(), "bili-codex-metadata-fallback-"));
+    const previousDataHome = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = dataHome;
+    t.after(() => {
+        if (previousDataHome === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = previousDataHome;
+        rmSync(dataHome, { recursive: true, force: true });
+    });
+    const workspaceRoot = mkdtempSync(path.join(tmpdir(), "bili-codex-no-git-"));
+    t.after(() => rmSync(workspaceRoot, { recursive: true, force: true }));
+    const current = session("codex-desktop-metadata-fallback");
+    const options = { ...DEFAULT_WORKFLOW_OPTIONS, sessionGc: false, rolloverMinTokens: 1_000_000 };
+    await preprocessResponsesWorkflow(desktopBody([], workspaceRoot), current, options, 400_000, true);
+    assert.equal(current.workflow.repoBridge.head, "deadbeef");
+    assert.equal(current.workflow.repoBridge.remoteIdentity, "https://example.invalid/acme/sample");
+    assert.match(current.workflow.projectId ?? "", /^project-/);
+    assert.equal(current.workflow.repoBridge.dirty, true);
 });
 
 test("Responses Requirement identity uses ACP references when user items have no message.id", async (t) => {

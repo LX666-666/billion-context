@@ -38,6 +38,7 @@ import { fetchWithTimeout } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { captureUsage, type UsageCaptureCtx } from "./usage/capture.js";
 import { expandOperation, retrieveRawOutput } from "./workflow/archive.js";
+import { arbitrateAcpRanges } from "./workflow/acp-arbitration.js";
 import { recordWorkflowUsage } from "./workflow/cache-policy.js";
 import { recordWorkflowCheckpoint } from "./workflow/context-gc.js";
 import { markWorkflowOperations } from "./workflow/operation-tracker.js";
@@ -138,7 +139,14 @@ function executeProxyTool(
     ctx: CompressLoopResponsesCtx,
 ): string {
     if (toolName === "compress") {
-        return applyRanges(parseCompressInput(args), ctx);
+        const parsedRanges = parseCompressInput(args);
+        const workflow = ctx.session.workflow;
+        if (!workflow) return applyRanges(parsedRanges, ctx);
+        const arbitration = arbitrateAcpRanges(workflow, parsedRanges, ctx.messages);
+        if (arbitration.rejected.length > 0) {
+            ctx.log(`[acp-arbitration] rejected ${arbitration.rejected.length}/${parsedRanges.length} range(s): ${arbitration.reason}`);
+        }
+        return applyRanges(arbitration.ranges, ctx);
     }
     if (toolName === "decompress") {
         return resolveDecompress(args, ctx);
@@ -534,9 +542,16 @@ export async function compressLoopResponsesJson(
             }
             const result = executeProxyTool(call.name, args, ctx);
             ctx.log(`[acp-proxy: responses JSON ${call.name} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
-            inputItems.push(nativeCallIds.has(call.callId)
-                ? { type: "message", role: "developer", content: buildVisibilityMarker(call.name, result) }
-                : { type: "message", role: "assistant", content: buildWorkflowResultText(call.name, buildVisibilityMarker(call.name, result)) });
+            if (nativeCallIds.has(call.callId) && call.name !== COMPRESS_TOOL_NAME) {
+                inputItems.push(
+                    { type: "function_call", id: call.itemId, call_id: call.callId, name: call.name, arguments: call.arguments },
+                    { type: "function_call_output", call_id: call.callId, output: result },
+                );
+            } else {
+                inputItems.push(nativeCallIds.has(call.callId)
+                    ? { type: "message", role: "developer", content: buildVisibilityMarker(call.name, result) }
+                    : { type: "message", role: "assistant", content: buildWorkflowResultText(call.name, buildVisibilityMarker(call.name, result)) });
+            }
         }
         const checkpointRetryExhausted = proxyCalls.some((call) =>
             call.name === "workflow_checkpoint"

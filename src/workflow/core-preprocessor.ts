@@ -1,19 +1,21 @@
 import type { BiliMessage } from "../bili-message.js";
 import type { Session } from "../session.js";
 import { applyDeferredRollover, beginWorkflowTurn, checkpointRequest, workflowMemory } from "./context-gc.js";
-import { attachOperationMessageRefs, operationForCall, trackOperationCall, updateOperationResult } from "./operation-tracker.js";
+import { attachOperationMessageRefs, observeCodexNestedOperations, operationForCall, trackOperationCall, updateOperationResult } from "./operation-tracker.js";
 import { applyPlanUpdate } from "./plan-tracker.js";
 import { extractCodexUpdatePlanCalls } from "./codex-code-mode.js";
-import { hydrateProjectMemory, runCheapHistorian } from "./project-memory.js";
 import { pruneWithCheapModel } from "./pruner/cheap-model.js";
 import { commitSemanticPrune, pruneToolOutput } from "./pruner/index.js";
+import { hydrateProjectMemory, runCheapHistorian } from "./project-memory.js";
 import { syncRequirements } from "./requirements.js";
 import { requirementMessageCanDrop } from "./requirements.js";
+import { ingestRequirementDocumentForOperation, registerPendingRequirementDocuments } from "./requirement-document.js";
 import { capturePhaseMessage } from "./state.js";
 import { observePhaseBoundaryFallback } from "./phase-boundary.js";
 import type { WorkflowOptions } from "./types.js";
 import { observeRepositoryOperation, refreshRepoBridge, repoProjectId, repositoryGuardMessage, workspaceRootFromText } from "./repo-bridge.js";
 import { isWorkflowMessage } from "./workflow-item.js";
+import { executionSupervisorNudge } from "./execution-supervisor.js";
 
 export async function preprocessCoreWorkflow(
     messages: BiliMessage[],
@@ -33,6 +35,7 @@ export async function preprocessCoreWorkflow(
     session.workflow.projectId ??= options.projectKey?.trim() || repoProjectId(session.workflow.repoBridge);
     if (options.sessionGc) hydrateProjectMemory(session.id, session.workflow, options.memory.maxProjectSessions);
     syncRequirements(session.workflow, messages, session.id);
+    registerPendingRequirementDocuments(session.workflow, messages, session.id, workspace ?? options.repoBridge.workspaceRoot);
     observePhaseBoundaryFallback(session.workflow, messages);
     if (options.sessionGc) await runCheapHistorian(session.id, session.workflow, options);
     applyDeferredRollover(session.workflow, options, session.stats.lastInputTokens || session.stats.contextTokens, modelContextLimit, model);
@@ -46,6 +49,7 @@ export async function preprocessCoreWorkflow(
               : [];
         for (const planCall of planCalls) applyPlanUpdate(session.workflow, planCall.callId, planCall.argumentsText);
         observeRepositoryOperation(session.workflow, operation, options.repoBridge);
+        observeCodexNestedOperations(session.workflow, operation, options.repoBridge);
     }
     for (const message of messages) {
         const operation = message.toolCallId ? operationForCall(session.workflow, message.toolCallId) : undefined;
@@ -85,6 +89,9 @@ export async function preprocessCoreWorkflow(
             continue;
         }
         const raw = message.text ?? "";
+        if (operation.type === "READ") {
+            ingestRequirementDocumentForOperation(session.workflow, operation, raw, session.id, workspace ?? options.repoBridge.workspaceRoot);
+        }
         let result = pruneToolOutput(operation, raw, options);
         result = await pruneWithCheapModel(operation, result, options, { phaseObjective, requirementHint });
         result = commitSemanticPrune(session.id, session.workflow, operation, raw, result, options.archiveSemanticRaw);
@@ -106,6 +113,7 @@ export async function preprocessCoreWorkflow(
         workflowMemory(session.workflow, options.rereadAfterPhase, options.memory.maxInjectedTokens),
         checkpointRequest(session.workflow, false),
         repositoryGuardMessage(session.workflow),
+        executionSupervisorNudge(session.workflow),
     ].filter((value): value is string => Boolean(value));
     for (const [index, tail] of tails.entries()) {
         filtered.push({

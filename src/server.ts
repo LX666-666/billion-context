@@ -971,7 +971,7 @@ async function prepareResponses(
             if (!process.env.ACP_NO_INJECT_TOOL) {
                 const desired = [
                     ...(shouldInject ? (responsesTextProtocol ? ACP_READONLY_TOOLS_RESPONSES : ACP_CONTEXT_TOOLS_RESPONSES) : []),
-                    ...(workflowOptions.enabled ? WORKFLOW_TOOLS_RESPONSES : []),
+                    ...(workflowOptions.enabled && !responsesTextProtocol ? WORKFLOW_TOOLS_RESPONSES : []),
                 ];
                 toolsOut = injectResponsesTool(workflowParsed.tools, desired);
             }

@@ -5,7 +5,14 @@ import { validateCheckpointAgainstPhase } from "./checkpoint-validator.js";
 import { attachCheckpointToTask } from "./project-memory.js";
 import { archiveHistoricalRequirements, refreshRequirementHistory } from "./requirements.js";
 import { markPhaseMessagesPendingDrop, recomputeWorkflowMetrics } from "./state.js";
-import type { OperationRecord, WorkflowCheckpoint, WorkflowOptions, WorkflowState } from "./types.js";
+import type {
+    OperationRecord,
+    PhaseRecord,
+    RequirementStatus,
+    WorkflowCheckpoint,
+    WorkflowOptions,
+    WorkflowState,
+} from "./types.js";
 
 const MAX_CHECKPOINT_AUTO_RETRIES = 1;
 
@@ -70,6 +77,35 @@ function operationIsKept(operation: OperationRecord, keepRefs: Set<string>): boo
     if (operation.importance === "CRITICAL") return true;
     if (keepRefs.has(operation.opId)) return true;
     return [...operation.callRefs, ...operation.resultRefs].some((ref) => keepRefs.has(ref));
+}
+
+function effectiveRequirementSnapshot(
+    state: WorkflowState,
+    phase: PhaseRecord,
+    updates: WorkflowCheckpoint["requirementUpdates"],
+): Array<{ id: string; status: RequirementStatus }> {
+    const updateById = new Map(updates.map((update) => [update.id, update]));
+    return Object.values(state.requirements)
+        .filter((requirement) => requirement.taskId === phase.taskId && requirement.provenance === "REAL_USER_REQUIREMENT")
+        .map((requirement) => {
+            const update = updateById.get(requirement.id);
+            return update
+                ? { id: requirement.id, status: update.status }
+                : { id: requirement.id, status: requirement.status };
+        });
+}
+
+function requirementUpdatesWillChangeState(
+    state: WorkflowState,
+    updates: WorkflowCheckpoint["requirementUpdates"],
+): boolean {
+    return updates.some((update) => {
+        const requirement = state.requirements[update.id];
+        if (!requirement) return false;
+        if (requirement.status !== update.status) return true;
+        if (update.supersededBy && requirement.supersededBy !== update.supersededBy) return true;
+        return false;
+    });
 }
 
 function archivePendingPhase(state: WorkflowState, phaseId: string): boolean {
@@ -143,16 +179,17 @@ export function recordWorkflowCheckpoint(
     }
     const checkpointId = `checkpoint${String(state.nextCheckpointNumber).padStart(5, "0")}`;
     const updates = requirementUpdates(args.requirementUpdates);
+    const effectiveSnapshot = effectiveRequirementSnapshot(state, phase, updates);
+    const willChangeState = requirementUpdatesWillChangeState(state, updates);
+    const nextLedgerVersion = willChangeState ? state.requirementLedgerVersion + 1 : state.requirementLedgerVersion;
     const checkpoint: WorkflowCheckpoint = {
         checkpointId,
         phaseId,
         ...(phase.taskId ? { taskId: phase.taskId } : {}),
         objective: text(args.objective) ?? phase.objective,
         ...(text(args.requirementState) ? { requirementState: text(args.requirementState) } : {}),
-        requirementLedgerVersion: state.requirementLedgerVersion,
-        requirementSnapshot: Object.values(state.requirements)
-            .filter((requirement) => requirement.taskId === phase.taskId && requirement.provenance === "REAL_USER_REQUIREMENT")
-            .map((requirement) => ({ id: requirement.id, status: requirement.status })),
+        requirementLedgerVersion: nextLedgerVersion,
+        requirementSnapshot: effectiveSnapshot,
         requirementUpdates: updates,
         completedWork,
         changedFiles: strings(args.changedFiles),
@@ -222,6 +259,7 @@ export function recordWorkflowCheckpoint(
         requirement.status = update.status;
         if (update.supersededBy) requirement.supersededBy = update.supersededBy;
     }
+    if (willChangeState) state.requirementLedgerVersion = nextLedgerVersion;
     state.checkpointQueue = state.checkpointQueue.filter((queued) => queued !== phaseId);
     phase.checkpointId = checkpointId;
     phase.status = "PENDING_ROLLOVER";

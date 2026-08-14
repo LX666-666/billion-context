@@ -24,7 +24,10 @@ export function classifyRequirementProvenance(text: string, internal = false): R
 }
 
 export function isRealUserRequirement(provenance: RequirementProvenance | undefined): boolean {
-    return provenance === undefined || provenance === "REAL_USER_REQUIREMENT";
+    return provenance === undefined
+        || provenance === "REAL_USER_REQUIREMENT"
+        || provenance === "USER_REQUIREMENT_POINTER"
+        || provenance === "USER_REQUIREMENT_DOCUMENT";
 }
 
 export function isCodexHostContext(text: string): boolean {

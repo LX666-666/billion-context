@@ -215,6 +215,50 @@ test("fallback boundary ignores assistant reports and consumes one user signal o
     assert.equal(state.phaseBoundaryCandidate, undefined);
 });
 
+test("fallback assigns the first new-target operation to a new phase", () => {
+    const state = createInitialWorkflowState();
+    const oldPhase = ensureActivePhase(state, "First objective");
+    const validation = trackOperationCall(state, "fallback-test", "shell_command", JSON.stringify({ command: "npm test" }));
+    updateOperationResult(state, validation, 20, 10, "[TEST PASS]\nexit_code: 0");
+
+    const operation = trackOperationCall(
+        state,
+        "fallback-patch",
+        "apply_patch",
+        JSON.stringify({ patch: "*** Begin Patch\n*** Update File: src/new.ts\n@@\n-old\n+new\n*** End Patch" }),
+    );
+
+    assert.notEqual(operation.phaseId, oldPhase.phaseId);
+    assert.equal(oldPhase.status, "CHECKPOINT_PENDING");
+    assert.deepEqual(oldPhase.operationIds, [validation.opId]);
+    assert.deepEqual(state.phases[operation.phaseId]?.operationIds, [operation.opId]);
+    assert.deepEqual(state.checkpointQueue, [oldPhase.phaseId]);
+});
+
+test("fallback waits for plan sync instead of closing an active plan phase", () => {
+    const state = createInitialWorkflowState();
+    applyPlanUpdate(state, "fallback-plan", plan([
+        ["Implement the next objective", "in_progress"],
+        ["Verify", "pending"],
+    ]));
+    const phaseId = state.activePhaseId;
+    assert.ok(phaseId);
+    const validation = trackOperationCall(state, "planned-test", "shell_command", JSON.stringify({ command: "npm test" }));
+    updateOperationResult(state, validation, 20, 10, "[TEST PASS]\nexit_code: 0");
+
+    const operation = trackOperationCall(
+        state,
+        "planned-patch",
+        "apply_patch",
+        JSON.stringify({ patch: "*** Begin Patch\n*** Update File: src/new.ts\n@@\n-old\n+new\n*** End Patch" }),
+    );
+
+    assert.equal(operation.phaseId, phaseId);
+    assert.equal(state.activePhaseId, phaseId);
+    assert.equal(state.phases[phaseId].status, "ACTIVE");
+    assert.deepEqual(state.checkpointQueue, []);
+});
+
 test("a rejected checkpoint retries once, then leaves the queue pending", () => {
     const state = createInitialWorkflowState();
     const phaseId = pendingTestPhase(state, "retry");

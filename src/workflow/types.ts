@@ -32,6 +32,8 @@ export type RequirementStatus =
 
 export type RequirementProvenance =
     | "REAL_USER_REQUIREMENT"
+    | "USER_REQUIREMENT_POINTER"
+    | "USER_REQUIREMENT_DOCUMENT"
     | "HOST_CONTEXT"
     | "PROJECT_INSTRUCTIONS"
     | "ENVIRONMENT_CONTEXT"
@@ -40,6 +42,14 @@ export type RequirementProvenance =
 export type PhaseMessageLifecycle = "ACTIVE" | "PENDING_DROP" | "ARCHIVED";
 
 export type RequirementMessageLifecycle = "ACTIVE" | "PENDING_DROP" | "ARCHIVED";
+
+export type CodexNestedOperation = {
+    type: OperationType;
+    command?: string;
+    workdir?: string;
+    paths: string[];
+    addedPaths: string[];
+};
 
 export type OperationRecord = {
     opId: string;
@@ -54,6 +64,7 @@ export type OperationRecord = {
     workdir?: string;
     paths: string[];
     addedPaths: string[];
+    codexNested?: CodexNestedOperation[];
     rawRef?: string;
     rawChecksum?: string;
     rawTokens: number;
@@ -109,6 +120,17 @@ export type HistoricalRequirementMessage = Pick<
     historicalAt?: number;
 };
 
+export type RequirementDocumentPointer = {
+    path: string;
+    sourceRef: string;
+    pointerRequirementId?: string;
+    requirementMessageId?: string;
+    rawRef?: string;
+    ingested: boolean;
+    createdAt: number;
+    ingestedAt?: number;
+};
+
 export type PlanStepStatus = "pending" | "in_progress" | "completed";
 
 export type PlanStepRecord = {
@@ -124,13 +146,29 @@ export type PlanRecord = {
     updatedAt: number;
 };
 
+export type ExecutionSupervisorPlanSyncKey = string;
+
+export type ExecutionSupervisorState = {
+    planSyncSent: ExecutionSupervisorPlanSyncKey[];
+    readOnlyStallSentPhaseId?: string;
+    redundantReadSent: Record<string, number>;
+    observationCount: number;
+    observationTokens: number;
+    mutationSeen: boolean;
+    completionEvidenceSeen: boolean;
+};
+
 export type WorkflowCheckpoint = {
     checkpointId: string;
     phaseId: string;
     taskId?: string;
     objective: string;
     requirementState?: string;
+    /** Ledger version captured atomically with this checkpoint's effective requirement
+     *  snapshot. Reflects the version AFTER the checkpoint's `requirementUpdates` are
+     *  applied, so the snapshot and version are consistent. */
     requirementLedgerVersion?: number;
+    /** Effective requirement status snapshot after applying `requirementUpdates`. */
     requirementSnapshot?: Array<{ id: string; status: RequirementStatus }>;
     requirementUpdates: Array<{
         id: string;
@@ -331,6 +369,7 @@ export type RepoFileSnapshot = {
     stale: boolean;
     staleReason?: "PHASE_BOUNDARY" | "HEAD_CHANGED" | "FILE_CHANGED";
     staleGeneration?: number;
+    requirementDocument?: boolean;
     observedAt: number;
 };
 
@@ -450,6 +489,9 @@ export type WorkflowState = {
     nextCheckpointNumber: number;
     nextRawNumber: number;
     nextRequirementMessageNumber: number;
+    /** Monotonic ledger version. Incremented on every deterministic Ledger state
+     *  change (new requirement, status transition via checkpoint updates, or
+     *  HISTORICAL archival via refreshRequirementHistory) — not only on inserts. */
     requirementLedgerVersion: number;
     nextPlanItemNumber: number;
     nextTaskNumber: number;
@@ -468,6 +510,8 @@ export type WorkflowState = {
     requirements: Record<string, RequirementRecord>;
     requirementMessages: Record<string, RequirementMessageRecord>;
     requirementBySourceRef: Record<string, string>;
+    pendingRequirementDocuments: string[];
+    requirementDocumentByPath: Record<string, RequirementDocumentPointer>;
     phases: Record<string, PhaseRecord>;
     checkpoints: Record<string, WorkflowCheckpoint>;
     rawArchive: Record<string, RawArchiveIndexRecord>;
@@ -488,6 +532,7 @@ export type WorkflowState = {
     repoBridge: RepoBridgeState;
     cacheTelemetry: CacheTelemetry;
     metrics: WorkflowMetrics;
+    supervisor: ExecutionSupervisorState;
 };
 
 export type WorkflowOptions = {

@@ -10,5 +10,8 @@ Re-read only repository/code facts that may have changed after a phase boundary.
 Treat <workflow-repository-guard> as a hard context barrier: do not use old requirements, checkpoints, summaries, source reads, diffs, or patch outputs to infer current code. Re-read every stale target, then validate the filesystem state before another PATCH or WRITE. A blocked mutation may already have executed locally, but its output is not evidence of success.
 Do not replace exact user requirements, engineering decisions, exact errors, file paths, identifiers, or unresolved blockers with vague summaries.
 Tool output may include raw_ref and opId references. Use retrieve_raw for exact archived output and expand_operation for operation metadata when those tools are available.
+For non-trivial tasks, establish a detailed plan with update_plan before doing the work. Keep one plan item in_progress at a time. Sync the plan with the actual order of work; when a step is genuinely complete, mark it completed promptly. Do not let the plan stay stale while claiming completion in prose. When a workflow-plan-sync reminder appears, review the actual work and update the plan only if the step is truly complete.
+Avoid long stretches of READ/SEARCH/LIST without converging on a mutation, an explicit blocker, or a plan adjustment. Do not re-read the same unchanged file in full within a phase. With sufficient evidence, prefer the smallest PATCH/WRITE plus validation over gathering more context.
+Prefer Workflow rollover for phase-owned context; use ACP compression only for eligible non-workflow historical context.
 ${checkpoint}`;
 }

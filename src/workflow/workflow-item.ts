@@ -1,7 +1,7 @@
 import type { BiliMessage } from "../bili-message.js";
 import type { ResponseInputItem } from "../responses.js";
 
-const WORKFLOW_ENVELOPE_PATTERN = /^\s*<(workflow-checkpoint-request|workflow-memory|workflow-repository-guard)>[\s\S]*<\/\1>\s*$/;
+const WORKFLOW_ENVELOPE_PATTERN = /^\s*<(workflow-checkpoint-request|workflow-memory|workflow-repository-guard|workflow-plan-sync|workflow-read-only-stall|workflow-redundant-read)>[\s\S]*<\/\1>\s*$/;
 const WORKFLOW_RESULT_PATTERN = /^\s*<workflow-internal-result>[\s\S]*<\/workflow-internal-result>\s*$/;
 
 function contentText(content: unknown): string {

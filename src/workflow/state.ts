@@ -1,5 +1,6 @@
 import { estimateTokensFast } from "acp-kernel";
 import type {
+    ExecutionSupervisorState,
     PhaseMessageRecord,
     PhaseRecord,
     RequirementMessageRecord,
@@ -34,6 +35,17 @@ export function createWorkflowMetrics(): WorkflowMetrics {
     };
 }
 
+export function createInitialSupervisorState(): ExecutionSupervisorState {
+    return {
+        planSyncSent: [],
+        redundantReadSent: {},
+        observationCount: 0,
+        observationTokens: 0,
+        mutationSeen: false,
+        completionEvidenceSeen: false,
+    };
+}
+
 export function createInitialWorkflowState(): WorkflowState {
     return {
         version: 1,
@@ -57,6 +69,8 @@ export function createInitialWorkflowState(): WorkflowState {
         requirements: {},
         requirementMessages: {},
         requirementBySourceRef: {},
+        pendingRequirementDocuments: [],
+        requirementDocumentByPath: {},
         phases: {},
         checkpoints: {},
         rawArchive: {},
@@ -79,6 +93,7 @@ export function createInitialWorkflowState(): WorkflowState {
             lastVisibleToolTokens: 0,
         },
         metrics: createWorkflowMetrics(),
+        supervisor: createInitialSupervisorState(),
     };
 }
 
@@ -108,6 +123,8 @@ export function mergeWorkflowState(value: WorkflowState | undefined): WorkflowSt
         requirements: value.requirements ?? {},
         requirementMessages: value.requirementMessages ?? {},
         requirementBySourceRef: value.requirementBySourceRef ?? {},
+        pendingRequirementDocuments: Array.isArray(value.pendingRequirementDocuments) ? value.pendingRequirementDocuments : [],
+        requirementDocumentByPath: value.requirementDocumentByPath ?? {},
         phases: Object.fromEntries(Object.entries(value.phases ?? {}).map(([phaseId, phase]) => [
             phaseId,
             { ...phase, itemKeys: Array.isArray(phase.itemKeys) ? phase.itemKeys : [] },
@@ -140,6 +157,12 @@ export function mergeWorkflowState(value: WorkflowState | undefined): WorkflowSt
             recentUsage: Array.isArray(value.cacheTelemetry?.recentUsage) ? value.cacheTelemetry.recentUsage : [],
         },
         metrics: { ...fresh.metrics, ...(value.metrics ?? {}) },
+        supervisor: {
+            ...fresh.supervisor,
+            ...(value.supervisor ?? {}),
+            planSyncSent: Array.isArray(value.supervisor?.planSyncSent) ? value.supervisor.planSyncSent : [],
+            redundantReadSent: value.supervisor?.redundantReadSent ?? {},
+        },
     };
     return migrateTaskState(merged);
 }
@@ -205,7 +228,18 @@ export function ensureActivePhase(state: WorkflowState, objective = "Unplanned w
     state.activePhaseId = phaseId;
     state.phaseBoundaryCandidate = undefined;
     state.sessionStatus = "ACTIVE";
+    resetSupervisorForPhase(state, phaseId);
     return phase;
+}
+
+export function resetSupervisorForPhase(state: WorkflowState, phaseId: string): void {
+    if (state.supervisor.readOnlyStallSentPhaseId === phaseId) return;
+    state.supervisor.readOnlyStallSentPhaseId = undefined;
+    state.supervisor.observationCount = 0;
+    state.supervisor.observationTokens = 0;
+    state.supervisor.mutationSeen = false;
+    state.supervisor.completionEvidenceSeen = false;
+    state.supervisor.redundantReadSent = {};
 }
 
 export type CapturePhaseMessageInput = {
